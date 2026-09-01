@@ -1,0 +1,66 @@
+# Prior art
+
+Real systems and papers researched before designing Sub0Firn, fetched and cited directly rather than
+recalled from training data (the discipline this drew from: verify against the actual reference source
+before designing against it, the same rule a good engineering team applies to any algorithm/system it's
+about to build on top of — quote the source, don't paraphrase from memory). Every row below either
+solves this exact problem (huge, sparsely-accessed, effectively-frozen table; too big to hold resident;
+real read-bandwidth pressure on whatever the slow tier is) or a structurally adjacent one worth knowing
+about and explicitly distinguishing from.
+
+**Confidence tags**: **High** = primary source fetched and quoted directly; **Medium** = fetched, but an
+automated summarizer rendered the content rather than raw extracted text (hit twice below — both PDFs
+came back as undecoded binary to the fetch tool, so those citations rest on the tool's own summary, not
+an independently re-checked verbatim quote); **title-only** = a real, existing, citable source located
+via search, not independently fetched.
+
+| System | What it actually does | Confidence |
+|---|---|---|
+| **NVIDIA Merlin HugeCTR — Hierarchical Parameter Server (HPS)** | Real quote, `hugectr_parameter_server.html`: *"a three-level storage architecture. The first and highest performing level is GPU memory and is followed by CPU memory. The third layer can be high-speed local SSDs with or without a distributed database."* Backend technologies, also quoted verbatim: local CPU-memory tier = `hash_map`/`parallel_hash_map`/`multi_process_hash_map`, or `redis_cluster` for a **distributed** CPU-memory tier; disk tier = `rocks_db` ("Create or connect to a RocksDB database"). GPU-tier eviction is explicitly LRU: *"Prune embeddings starting from the oldest embedding until the partition contains at most `overflow_margin * overflow_resolution_target` embeddings. This policy implements the least-recently used (LRU) algorithm."* A `hit_rate_threshold` config knob controls whether a GPU-cache miss triggers a **synchronous** or **asynchronous** insert: below threshold, synchronous (correctness-first, accept the stall); above threshold, asynchronous (throughput-first, the rare miss doesn't block). **Caveat found, not hidden**: the standalone HPS module has been **deprecated since v25.03** per its own current docs page — real production evidence that a bespoke multi-backend DB-serving layer for this exact problem is expensive enough to maintain that even NVIDIA's own team retired the standalone form (folded into a newer serving stack rather than kept as a separable component) — worth weighing against building something similarly broad. | **High** |
+| **Bandana (Facebook/Meta, MLSys 2019)** | Real abstract, quoted in full: *"We present Bandana, a storage system that reduces the DRAM footprint of embeddings, by using Non-volatile Memory (NVM) as the primary storage medium, with a small amount of DRAM as cache. The main challenge in storing embeddings on NVM is its limited read bandwidth compared to DRAM. Bandana uses two primary techniques to address this limitation: first, it stores embedding vectors that are likely to be read together in the same physical location, using hypergraph partitioning, and second, it decides the number of embedding vectors to cache in DRAM by simulating dozens of small caches. These techniques allow Bandana to increase the effective read bandwidth of NVM by 2-3x."* **This is the single most load-bearing citation for this design** — see below. | **High** (abstract verbatim; body text came back corrupted from the PDF fetch, so the hypergraph-partitioning mechanism's exact algorithm is not independently re-verified beyond the abstract's own description) |
+| **TT-Rec (Meta, MLSys 2021, arXiv:2101.11714)** | Tensor-Train factorization replacing a dense embedding table with a product of small "core" tensors. Real reported result (search-confirmed, title/authors Yin, Acun, Liu, Wu): **112x model-size reduction on a terabyte-scale table with no accuracy loss and no training-time overhead** vs. the uncompressed baseline, plus an optimized `TT-EmbeddingBag` kernel reported 3x faster than prior TT implementations. | Medium (title/result confirmed via search summary, not a direct fetch of the paper body) |
+| **DeepSpeed ZeRO-Infinity — NVMe parameter/optimizer-state offload** | Real, documented config surface (`deepspeed.readthedocs.io`): NVMe offload is configured with a **buffer pool** (`nvme_path`, buffer count, buffer size defaulting to 100,000,000 elements) and a **fixed CPU-resident element count** (default 1,000,000,000) — i.e. it is designed around large **sequential, bulk** reads of contiguous parameter/optimizer-state shards streamed to/from NVMe at high aggregate bandwidth, reported able to fit a 33.3B-param model's states across CPU+NVMe. **Deliberately a negative precedent for this problem**: nothing in this design does per-row, hash-addressed random lookup — it offloads whole parameter groups per training step, not sparse rows on demand. Citing it mainly to rule it out as a template, not to reuse its mechanism. | **High** (docs quoted directly) |
+| **Frequency-aware GPU software cache for DLRM (arXiv:2208.05321)** | Real abstract, quoted in full: *"We propose a GPU-based software cache approach to dynamically manage the embedding table in the CPU and GPU memory space by leveraging the id's frequency statistics of the target dataset... Evaluating our prototype system shows that we can keep only 1.5% of the embedding parameters in the GPU to obtain a decent end-to-end training speed."* Concrete anchor number used for the VRAM-tier estimate below. Frequency-based (LFU-shaped), not recency-based (LRU) — the literature in this space consistently prefers frequency over recency because embedding-id access in recommendation workloads is Zipfian/skewed rather than recency-correlated. | **High** (abstract verbatim) |
+| **DLRM hot/cold popularity-based splitting (Mahajan et al., VLDB 2022, "Accelerating Recommendation System Training by Leveraging Popular Choices")** | Same family as the row above: split embedding rows into a small "popular"/hot partition kept in fast memory and a large "cold" partition kept in slow memory, sized from real access-frequency statistics rather than a fixed ratio. | Title-only (located, not fetched) |
+| **MoE-Infinity (arXiv:2401.14361) — sparsity-aware expert cache for MoE inference on personal machines** | **Directly analogous, not just adjacent**: this is a huge sparse model (mixture-of-experts) routing to a tiny active subset per token, run on a resource-constrained personal machine, with a disk-tier cache. Core claim (tool-summarized, not independently re-quoted verbatim — see confidence note): a routing-structure-aware predictive cache beats plain LRU because MoE expert activation is *structured*, not i.i.d. — the paper models expert-transition patterns to prefetch before a request, rather than reacting to a miss after it happens. Reported magnitude numbers (memory reduction, hit-rate deltas vs. LRU) came back from the fetch tool as a paraphrase with specific percentages attached; **these exact percentages are not independently verified against the paper's raw text this pass and should be treated as approximate, not load-bearing** — the qualitative claim (structure-aware prediction beats generic recency-based eviction for this exact shape of workload) is the part being relied on here. | **Medium** (qualitative claim); **Low** (specific percentages) |
+| **FlashMoe (arXiv, 2026) — ML-based cache replacement for SSD-offloaded MoE experts** | Recent (2026), same problem shape as MoE-Infinity, reportedly combining recency and frequency signals adaptively for expert-cache replacement rather than committing to one policy. Notable mainly as evidence this exact problem class (huge sparse table on personal-scale hardware, disk-tier cache, prediction beats a single fixed eviction policy) is still an active, unsettled research area as of this pass, not a solved one. | Title-only |
+| **mmap + OS page cache as an implicit cache tier** | General finding across multiple sources: for large-file random access, `mmap` avoids `read()`'s per-call syscall/seek overhead and lets the kernel's own LRU-based page cache absorb re-reads for free — "the OS already does most of this job" is a real, load-bearing null hypothesis worth taking seriously before building a bespoke tier. It stops applying specifically when the row size is small relative to the page size *and* physically adjacent rows are not access-correlated — see "Where this stops applying" below. | Medium (general finding, several corroborating but non-primary sources) |
+| **LMDB vs. RocksDB as the disk-tier KV format** | LMDB: B+tree over an `mmap`'d file, true zero-copy reads (a lookup returns a pointer straight into the mapping, no deserialization/copy step), MVCC with a single writer and unlimited concurrent lock-free readers, **no background compaction** (so no compaction-induced latency spikes — "consistently fast reads and predictable latency," per the sourced summary). RocksDB: LSM-tree, write-optimized, real write amplification, and background compaction that **can** spike tail read latency. | Medium (general design summary from multiple docs/comparison sources, not a single primary spec fetched verbatim) |
+
+## The single most load-bearing citation, and why
+
+**Bandana.** It is the only source above solving *exactly* this problem — a huge, mostly-frozen
+embedding table, a small DRAM budget, real read-bandwidth pressure on the slow tier — rather than a
+training-time or MoE-routing variant of it. Its two techniques map onto this design directly:
+
+1. **Co-access-aware physical placement** ("store vectors likely to be read together in the same
+   physical location") is the mechanism that makes a disk/NVM tier's coarse read granularity (a page, a
+   block, an OS readahead window) actually pay for itself instead of wasting most of every fetch on
+   unrelated rows.
+2. **Measure-then-size the cache, don't guess it** ("simulating dozens of small caches") is a concrete,
+   checkable technique this project should reuse directly once a real access trace exists — every
+   hit-rate number in this project's design docs is currently an *estimate* for exactly this reason: no
+   trace exists yet to run Bandana's own sizing technique against.
+
+## Where mmap + OS page cache stops applying
+
+Worth resolving concretely rather than leaving as a vague caveat, since it's the honest null hypothesis
+any deployment should re-litigate before building a bespoke tier: it stops being sufficient specifically
+when the caller's row size is small relative to the page size (a typical embedding row here is
+320–640 bytes against a 4KB page) *and* physically adjacent rows are not access-correlated (true for a
+hash-bucket-addressed table, where row placement order has no relationship to co-access order). Bandana's
+own contribution is precisely closing that gap via co-access-aware placement.
+
+## Where the literature disagrees or evidence is thin, stated honestly
+
+HugeCTR's own team retired the standalone HPS module even though the 3-tier shape it implemented is
+echoed by nearly every other source here — that is evidence the *shape* is right but a *fully general,
+multi-backend, always-on service* is expensive to keep alive, not evidence against tiering itself. TT-Rec's
+compression approach and every caching approach above are not competitors so much as orthogonal axes
+(compress the table vs. tier its serving) and nothing located this pass directly compares them
+head-to-head on the same workload — that comparison, if it matters, is open. MoE-Infinity's and
+FlashMoe's exact quantitative claims are the thinnest evidence in this table precisely because both PDF
+fetches came back corrupted/summarized rather than raw text; their qualitative direction (prediction
+beats naive recency for structured sparse access) is corroborated by every other source in this table
+that discusses eviction policy at all (HugeCTR's LRU-by-default is the one outlier, and even it adds a
+frequency-adjacent `hit_rate_threshold` knob on top).
