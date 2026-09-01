@@ -37,11 +37,13 @@ first, compute unconditionally after. `docs/reference-consumer-sub0llm.md` §1 t
 Sub0Llm's real `forward()` call site to confirm the shape actually fits a real caller, not just a
 hypothetical one.
 
-## R4. Rows are immutable between registration and an explicit `invalidate`
+## R4. A row's VALUE is immutable between registration and an explicit `invalidate`
 
 "A row resolved into any tier is guaranteed correct as of the table's current `version_tag` until that
 table's next `invalidate` call. There is no TTL-based expiry and no background staleness."
 
+Deliberately scoped to a row's *value*, not to the table's addressable *size* — see "Deferred: a
+table's addressable row range MAY grow" below for why that distinction is load-bearing, not pedantic.
 The tables Sub0Firn serves are either genuinely frozen (an imported checkpoint) or updated only at
 well-defined bulk boundaries a caller signals explicitly (R1's non-goal already rules out per-row writes)
 — a silent expiry policy would be solving a write-concurrency problem that doesn't exist here, at the
@@ -107,6 +109,44 @@ Without this, "is the cache actually working" becomes a guess. Matches the same 
 own "a drop is never silent" requirement (a sibling project's real, already-written requirement,
 independently arriving at the same principle: a mechanism whose own effectiveness can't be observed
 can't be trusted or tuned).
+
+## Deferred: a table's addressable row range MAY grow (named now, not required for v1)
+
+Raised directly: is R4's "frozen" a hard invariant of the whole design, or an artifact of v1's
+simplicity that a later mode could relax? Worked through concretely — the answer is neither, quite: R4
+itself (a resolved row's *value* never silently changes) stays a hard requirement forever, because it's
+what makes caching correct. What's actually optional is whether a table has exactly one source or more
+than one.
+
+**DR1.** "A logical `table_handle` MAY resolve through more than one registered source, layered with a
+defined precedence (an `overlay` shadowing a `base`) — the base stays genuinely frozen per R4 unchanged;
+the overlay is append-only under a single administrative writer, and new entries may be added to it
+without invalidating or re-fetching anything already resolved from the base." Not required for v1 (which
+implements single-source tables only), but the row-addressing model must not preclude it later — a
+`table_handle` should be free to later resolve through more than one registered source without a
+wire-format or on-disk-cache-format change forced by the addition.
+
+**Why this is the right shape, not just a plausible one**: the real motivating case is layering a small,
+genuinely local, incrementally-growable vocabulary extension on top of the huge frozen `Qwen/Qwen3.8-Flash-Next`
+n-gram table (`docs/reference-consumer-sub0llm.md`) — new project-specific n-grams a deployment wants
+without the 320-million-row base ever needing to change, grow, or be re-fetched. Two real, checked
+precedents, pointing at the same shape from different directions (`docs/prior-art.md` has the full
+citations):
+
+- **HugeCTR's dynamic embedding table** (`embedding_vec_size = -1`) genuinely grows at runtime — a new
+  key seen during training gets a freshly-initialized row inserted on the spot. This is the closest real
+  precedent for *growth itself*, but it grows via gradient training, which is squarely outside Sub0Firn's
+  own scope (R9: not a training framework) — cited as evidence the pattern is real and shipped, not as a
+  mechanism to reuse directly.
+- **HugeCTR's own Hierarchical Parameter Server (the *inference*-time counterpart of the same project)
+  does NOT auto-insert a missing key** — it returns a configured default value instead. This is the
+  closer analog to Sub0Firn's actual role (serving, not training) and is worth taking seriously as a
+  reason DR1 should stay opt-in rather than default behavior: an inference-time system silently
+  fabricating new "learned" content for an unrecognized key is a correctness trap, not a convenience.
+- **Overlay/union-filesystem composition** (the well-established OS pattern — a read-only lower layer
+  plus a writable upper layer, composited transparently at lookup time) is the actual architectural fit
+  here, not the training-time analog: DR1's `base`/`overlay` split is the same shape, applied to rows
+  instead of files.
 
 ## Non-requirements (explicitly out of scope, see README §1b for the full list)
 

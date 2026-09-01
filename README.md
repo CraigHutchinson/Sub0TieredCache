@@ -86,7 +86,9 @@ write-optimized database is solving a problem that doesn't exist here.
   are either genuinely frozen (an imported checkpoint) or updated only at well-defined bulk boundaries
   (e.g. a training checkpoint) — never concurrently mutated by multiple writers mid-flight. Single-writer,
   many-reader is the entire concurrency model this project needs to get right (§3); anything requiring
-  real multi-writer conflict resolution is out of scope.
+  real multi-writer conflict resolution is out of scope. (This is per-source, not a ceiling on a
+  logical table having more than one source — see `REQUIREMENTS.md`'s DR1: an overlay source is still a
+  single administrative writer, just a second one layered over the base's.)
 - **Not a model file format, and not a model-serving system.** Sub0Firn does not know what a "layer" or
   a "checkpoint" is. It serves rows; what those rows mean is entirely up to the caller.
 
@@ -159,10 +161,12 @@ invalidate(table_handle, new_version_tag)
     // (§1b's "defined update boundaries"), not a per-row write API — there is no per-row write API.
 ```
 
-**`source_descriptor` variants** (one table registration names exactly one; a caller wanting a
-multi-source fallback chain composes it by registering the same logical table under one handle backed by
-a layered descriptor — a single flat local file, a local shard set + offset-resolution callback, or a
-remote HTTP(S) Range source + local disk cache directory):
+**`source_descriptor` variants** (v1: one table registration names exactly one source — a single flat
+local file, a local shard set + offset-resolution callback, or a remote HTTP(S) Range source + local
+disk cache directory. `REQUIREMENTS.md`'s DR1 names, but defers past v1, a `base`+`overlay` layered form
+of this — a frozen remote/local base source shadowed by a small, genuinely-writable local overlay for
+incrementally-added rows; not implemented yet, but `register_table`'s signature should stay free to grow
+a second, optional overlay-source parameter without a wire-format break):
 
 - `local_flat_file(path)` — one file, rows at `row_index * row_width_bytes`, `mmap`'d.
 - `local_sharded(shard_paths[], offset_resolver_callback)` — a caller-supplied callback maps
