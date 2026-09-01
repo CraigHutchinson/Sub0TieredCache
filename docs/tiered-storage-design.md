@@ -7,7 +7,7 @@ correctness oracle without needing it fully resident. It's carried over here ver
 this project's own prior-art research and design rationale — Sub0Llm is the first, motivating consumer
 of Sub0Firn, not a separate concern from it. References below to `AGENTS.md`, `docs/QWEN4_PREVIEW_REFERENCE.md`,
 `docs/NGRAM_EMBEDDING.md`, and similar are Sub0Llm-internal documents, kept as context for where the
-requirements in [README.md](README.md) actually came from — not files that exist in this repo.
+requirements in [../README.md](../README.md) actually came from — not files that exist in this repo.
 
 Status: **DESIGN ONLY. No engine code this pass.** Follows the staging convention of Sub0Llm's own
 `docs/DEPTH_ATTENTION.md`/`docs/GATED_DELTANET.md`/`docs/NGRAM_EMBEDDING.md` (numbered findings, a
@@ -15,8 +15,8 @@ staged plan with checkable exit conditions, an explicit "novel vs reuses an exis
 sources cited with a confidence tag) but this doc's own "Stage 0" has no landed code — the staging
 below is the deliverable, not a record of what shipped.
 
-**Companion doc**: [README.md](README.md) — the spec/requirements for **Sub0Firn**, the standalone
-project this design spins the tiered-storage engine out into (see §7). This doc
+**Companion doc**: [../README.md](../README.md) — the spec/requirements for **Sub0Firn**, the standalone
+project this design spins the tiered-storage engine out into (see `../README.md` §5). This doc
 covers the problem, the prior art, and how Sub0Llm's own engine reconciles with it; that doc covers what
 Sub0Firn itself promises as an independent, engine-agnostic library.
 
@@ -56,7 +56,7 @@ the same design.
 
 ## 1. Real prior art
 
-Moved to its own document, **[PRIOR_ART.md](PRIOR_ART.md)** — real systems and papers, fetched and
+Moved to its own document, **[prior-art.md](prior-art.md)** — real systems and papers, fetched and
 quoted (not recalled), each with an honest confidence tag, kept as its own standalone artifact rather
 than embedded in this design narrative so it can be found, cited, and extended on its own. Read it before
 this section if you want the full research; the short version, needed for what follows: **Bandana
@@ -82,7 +82,7 @@ every row those ids address into a flat, pre-sized arena buffer, THEN run the ex
 `op_embed`/`op_linear`/`op_add` pipeline reading from that buffer instead of from a resident
 `PARAM_LAYOUT` tensor. `op_embed` itself does not need to change — only what it's an embedding lookup
 *into* changes, from "the resident table" to "this call's already-resolved working-set buffer," which
-is exactly the kind of substitution the thin-client interface (§7, `README.md`) exists to make
+is exactly the kind of substitution the thin-client interface (`../README.md` §5) exists to make
 clean.
 
 **How the resolve pass gets its row-ids differs sharply between training and decode — the brief is right
@@ -207,7 +207,7 @@ really the same knob at all, for case 1**:
 
 - **Case 1 (external frozen table, e.g. real Qwen weights)** is not, and was never proposed to be, a
   `PARAM_LAYOUT` entry in this engine's terms — it isn't trained, isn't checkpointed by this project,
-  and is consumed through the new thin-client interface (§7), not through `op_embed`'s existing
+  and is consumed through the new thin-client interface (`../README.md` §5), not through `op_embed`'s existing
   resident-tensor path. There is no `NGRAM_EMBED`-shaped axis to be a runtime alternative *to*, because
   nothing about `ARCH_FINGERPRINT`/checkpoint shape is at stake — a Sub0Llm build that consumes an
   external tiered table is choosing a **different data source for a `Node`'s input**, structurally the
@@ -239,7 +239,7 @@ family — most naturally a sibling of `corpus.tok` (keyed by the SAME corpus id
 already tracks, since case-2's working set is a function of the corpus) for the training-time
 precomputed-working-set case, or a `generated/`-relative cache directory for anything build-config-scoped
 rather than corpus-scoped. **This convention is Sub0Llm's own and must not leak into Sub0Firn** — per the
-brief's own instruction and `README.md`'s explicit non-goal, Sub0Firn (a spun-off, portable
+brief's own instruction and `../README.md`'s explicit non-goal, Sub0Firn (a spun-off, portable
 library) instead defaults to a platform-appropriate user/system cache directory (`XDG_CACHE_HOME` on
 Linux, `%LOCALAPPDATA%` on Windows, `~/Library/Caches` on macOS — the same three-way split most portable
 cache libraries already use), configurable, with Sub0Llm's own build simply pointing its Sub0Firn client
@@ -293,7 +293,7 @@ Each stage names whether it is buildable as **Sub0Firn standalone, zero Sub0Llm 
 **Sub0Llm integration**, per the brief's spin-off framing.
 
 - **Stage 0 — Sub0Firn: the engine-agnostic interface + an in-memory reference implementation.**
-  `resolve`/`resolve_many`/`prefetch`/`try_get` (exact signatures in `README.md`) implemented
+  `resolve`/`resolve_many`/`prefetch`/`try_get` (exact signatures in `../README.md`) implemented
   against a plain in-process hash map with no tiering at all — i.e. "the contract, proven with the
   simplest possible backend." Exit condition: a unit test registers a small synthetic table, resolves a
   batch of rows, and gets back exactly what was registered — no I/O, no async, no tiers yet. **Buildable
@@ -312,7 +312,7 @@ Each stage names whether it is buildable as **Sub0Firn standalone, zero Sub0Llm 
   §5 step 2 already established, applied to a serving-infra correctness question instead of a math one.
   **Buildable standalone** (needs network access and the public Hugging Face repo, nothing Sub0Llm-side).
 - **Stage 3 — Sub0Llm integration: thin-client op + resolve-pass wiring.** Sub0Llm vendors the Sub0Firn
-  client (§7's "how Sub0Llm consumes it"), and `Model::forward`'s existing n-gram block (§2a) gets an
+  client (`../README.md` §5, "how Sub0Llm consumes it"), and `Model::forward`'s existing n-gram block (§2a) gets an
   explicit resolve call inserted before its `op_embed`/`op_linear`/`op_add` composition, reading from the
   resolved buffer instead of a resident tensor — for an EXTERNAL table only; Sub0Llm's own trained table
   is untouched (§2e). Exit condition: with an external-table build pointed at a small local test table
@@ -343,7 +343,7 @@ Each stage names whether it is buildable as **Sub0Firn standalone, zero Sub0Llm 
 - **Case 2's checkpoint-format work** (§2e) — naming the additive-trailer shape is in scope; actually
   implementing it is not, per §0's distance argument. Revisit once a real Sub0Llm `NGRAM_TABLE_SIZE`
   sweep shows residency actually becoming a problem, not before.
-- **An out-of-process daemon / system-level shared cache** (§7's integration-seam discussion) — named as
+- **An out-of-process daemon / system-level shared cache** (`../README.md` §5's integration-seam discussion) — named as
   a real future option, not designed in detail or scheduled into the staged plan above; the staged plan
   only ever needs an in-process, vendored client through Stage 5.
 - **Compression (TT-Rec-style) as an alternative to tiering** — noted as orthogonal (§1, §5c reasoning)

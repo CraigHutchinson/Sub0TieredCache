@@ -1,11 +1,18 @@
 # Sub0Firn — a tiered cache for huge frozen sparse-lookup tables
 
-Status: **SPEC / REQUIREMENTS DRAFT.** Written to be handed to whoever bootstraps the standalone
-repository — no code exists yet, in either Sub0Llm or a separate repo. This document is the
-README-shaped spec for that repository; the design reasoning behind why it should exist as a separate
-project, and how it reconciles with Sub0Llm's own engine constraints, lives in the companion doc,
-[DESIGN_RATIONALE.md](DESIGN_RATIONALE.md) — read that first for the "why," this
-doc is the "what."
+Status: **SPEC / REQUIREMENTS DRAFT.** No implementation exists yet, in either Sub0Llm or this repo —
+`include/sub0firn/sub0firn.hpp` is a skeleton. This document is the pitch and the concrete API surface;
+[REQUIREMENTS.md](REQUIREMENTS.md) is the normative contract an implementation is checked against.
+
+**Documentation map**:
+- [REQUIREMENTS.md](REQUIREMENTS.md) — the normative contract (R1–R10), each a testable sentence.
+- [AGENTS.md](AGENTS.md) — pre-flight checklist for anyone (human or agent) implementing against this spec.
+- [STYLE_GUIDE.md](STYLE_GUIDE.md) — naming and code-style conventions.
+- [docs/](docs/) — reference material: [tiered-storage-design.md](docs/tiered-storage-design.md) (the
+  full design and why this should be a separate project — read this for the "why," this README is the
+  "what"), [prior-art.md](docs/prior-art.md) (real cited systems/papers), and
+  [reference-consumer-sub0llm.md](docs/reference-consumer-sub0llm.md) (the API traced against Sub0Llm's
+  real, already-merged consumer code).
 
 **Name**: **Sub0Firn**. *Firn* is the glaciology term for the compacted, intermediate layer of snow
 between fresh powder and solid glacial ice — a real, load-bearing metaphor here, not decoration: a
@@ -94,12 +101,11 @@ project rather than keeping it Sub0Llm-internal:
   open-weight model release), but structurally identical to reusing any other released model's huge
   embedding/lookup component.
 - **Recommendation-system-style embedding tables** — the exact problem shape the prior-art research
-  (`DESIGN_RATIONALE.md` §1) is drawn from (HugeCTR, Bandana, DLRM hot/cold splitting, the
+  (`docs/prior-art.md`) is drawn from (HugeCTR, Bandana, DLRM hot/cold splitting, the
   frequency-aware GPU cache). Sub0Firn is not a recommendation-system library, but the underlying
   row-serving problem is the same one those systems solve, minus everything about online training that
   they also need to handle and Sub0Firn deliberately does not.
-- **Sparse mixture-of-experts weight serving** — MoE-Infinity/FlashMoe (`DESIGN_RATIONALE.md`
-  §1) solve a structurally identical problem (huge sparse table, tiny active subset per request,
+- **Sparse mixture-of-experts weight serving** — MoE-Infinity/FlashMoe (`docs/prior-art.md`) solve a structurally identical problem (huge sparse table, tiny active subset per request,
   resource-constrained hardware) for expert weights rather than embedding rows; nothing in Sub0Firn's
   design is embedding-specific, so the same library could plausibly serve MoE expert weight blocks too,
   if a caller shaped the request that way.
@@ -134,7 +140,7 @@ resolve_into(table_handle, row_indices[], dest_buffer)
     // Synchronous. Caller supplies a pre-sized destination buffer (row_indices.size() * row_width_bytes)
     // and gets every named row copied into it, in the given order, blocking until done. The direct
     // building block for a caller's own "resolve pass before the hot loop" (see
-    // DESIGN_RATIONALE.md §2a) — call this once, up front, then read dest_buffer from the
+    // docs/tiered-storage-design.md §2a) — call this once, up front, then read dest_buffer from the
     // hot path with zero further calls into Sub0Firn.
 
 try_get(table_handle, row_index) -> optional<row_view>
@@ -162,11 +168,11 @@ remote HTTP(S) Range source + local disk cache directory):
 - `local_sharded(shard_paths[], offset_resolver_callback)` — a caller-supplied callback maps
   `row_index -> (shard_index, byte_offset)`, so Sub0Firn never needs to understand any particular
   external file format (safetensors, GGUF, or anything else) — that translation is the caller's
-  responsibility, matching `DESIGN_RATIONALE.md` §2d's point that this generalizes `gguf.hpp`'s
+  responsibility, matching `docs/tiered-storage-design.md` §2d's point that this generalizes `gguf.hpp`'s
   existing offset-computation logic rather than duplicating it inside Sub0Firn.
 - `remote_http_range(base_url, offset_resolver_callback, local_disk_cache_dir)` — same offset-resolution
   shape, but reads go over HTTP Range requests, with `local_disk_cache_dir` as the persistent disk tier
-  in front of the network (`DESIGN_RATIONALE.md` §2d's case (b)).
+  in front of the network (`docs/tiered-storage-design.md` §2d's case (b)).
 
 ### 3a. Consistency / staleness guarantees
 
@@ -182,14 +188,14 @@ row-by-row while cached copies might be in flight. Concretely:
   must itself carry the `version_tag` per cached entry (or per cache generation), so a second process
   opening the same cache directory can detect and skip entries written under a stale version rather than
   trusting file mtimes alone. The exact mechanism is an implementation decision for the chosen disk-tier
-  backend (`DESIGN_RATIONALE.md` §1g's LMDB-leaning discussion), not fixed by this spec, but
+  backend (`docs/prior-art.md`'s LMDB-leaning discussion), not fixed by this spec, but
   the guarantee itself (a reader can always tell a stale entry from a fresh one) is a hard requirement.
 - Sub0Firn makes **no promise about visibility across processes for a row resolved via `prefetch`/
   `resolve_into` but not yet flushed to a persistent tier** — that is purely an in-process, in-memory
   optimization from Sub0Firn's point of view. Cross-process sharing exists only at the disk-tier
   boundary, following whatever consistency model the disk backend itself provides (an MVCC-style
   embedded store gives "readers see the last-committed generation" for free, which is the recommended
-  shape — `DESIGN_RATIONALE.md` §1g).
+  shape — `docs/prior-art.md`).
 
 ### 3b. Concurrency model
 
@@ -207,7 +213,7 @@ row-by-row while cached copies might be in flight. Concretely:
 - **`try_get` must never block.** It either returns a resident row immediately or returns nothing —
   this is the one call in the contract a caller may safely place anywhere, including inside a tighter
   loop than the "resolve pass" the rest of the API is built around, precisely because it can never
-  introduce the unbounded-latency branch `DESIGN_RATIONALE.md` §2a's host engine cannot
+  introduce the unbounded-latency branch `docs/tiered-storage-design.md` §2a's host engine cannot
   tolerate.
 - **`wait` blocks only the calling thread**, never a global lock — other threads' independent
   `prefetch`/`resolve_into`/`try_get` calls must proceed unaffected.
@@ -215,7 +221,7 @@ row-by-row while cached copies might be in flight. Concretely:
 ## 4. What Sub0Firn stands on — prior art, as this project's own bootstrapping reference
 
 The full research behind this list — direct quotes, confidence tags, and the reasoning for why each one
-matters — lives in `DESIGN_RATIONALE.md` §1; restated here in the compressed form a project
+matters — lives in `docs/prior-art.md`; restated here in the compressed form a project
 README's own "prior art" section would carry, since that document doubles as this project's research
 foundation per the task that produced it:
 
@@ -227,7 +233,7 @@ foundation per the task that produced it:
 - **Bandana (Meta, MLSys 2019)** — the load-bearing citation. Small-DRAM-cache-in-front-of-NVM,
   co-access-aware physical row placement (hypergraph partitioning), and cache-size-by-simulation rather
   than by guess. Sub0Firn's disk-tier design should eventually adopt both techniques once a real access
-  trace exists to drive them (not designed yet — see `DESIGN_RATIONALE.md` §6).
+  trace exists to drive them (not designed yet — see `docs/tiered-storage-design.md` §6).
 - **TT-Rec (Meta, MLSys 2021)** — an orthogonal axis (compress the table) rather than a competing one
   (tier its serving); relevant mainly if Sub0Firn is ever asked to serve a table its *owner* is willing
   to re-factorize, not for serving an already-dense frozen checkpoint as-is.
@@ -284,7 +290,7 @@ adapts Sub0Firn's `resolve_into`/`try_get` calls into `op_embed`'s expected inpu
 Sub0Llm-specific, belongs in Sub0Llm) stays put; the tiered cache engine itself — the tier
 implementations, the eviction policies, the disk-format code, the HTTP Range client, the
 offset-resolver-callback contract generalized beyond any one file format — is exactly what moves to
-`sub0firn`. `DESIGN_RATIONALE.md` §2f already draws the matching line for on-disk *location*
+`sub0firn`. `docs/tiered-storage-design.md` §2f already draws the matching line for on-disk *location*
 conventions (Sub0Llm's own `out/build/<name>/generated/`-relative paths vs. Sub0Firn's own
 platform-appropriate user/system cache directory default) — the same split applies to code, not just
 paths: nothing in `sub0firn` should ever need to know what `out/build` or `generated/` mean.
@@ -313,98 +319,3 @@ same `local_disk_cache_dir` configuration, which is the entire point: "system/us
 is a **deployment configuration choice**, not an architectural axis Sub0Firn's own code needs to branch
 on.
 
-## 7. Reference consumer: Sub0Llm's n-gram embeddings, checked against the real merged code
-
-Everything above is an abstract contract. This section exists so it isn't *only* abstract: it traces the
-API against Sub0Llm's actual, already-merged n-gram embeddings implementation
-(`src/backend_cpu.cpp`/`include/sub0/layout.hpp`, `docs/NGRAM_EMBEDDING.md`) — real call sites, real
-shapes, real threading, not a hypothetical usage sketch. Where the trace surfaces a genuine gap the API
-above doesn't yet resolve, it's flagged as **OPEN**, not quietly designed around.
-
-### 7a. Training path (`Model::forward()`, one call per training window)
-
-Today's code computes `NGRAM_NUM_EMBEDDERS` small tables (a real worked example from
-`docs/NGRAM_EMBEDDING.md` §6: `D_MODEL=448, NGRAM_MAX_N=3, K=2` → 4 tables), each looked up
-`SEQ_LEN` times (one row per sequence position, up to 512 in a production build) — i.e. every
-`forward()` call computes `NGRAM_NUM_EMBEDDERS × SEQ_LEN` row indices (cheaply, in Sub0Llm's own code —
-Sub0Firn never sees the hash) and needs that many rows resolved before `op_embed` can run. Mapped
-directly onto §3's contract:
-
-```
-for e in 0..NGRAM_NUM_EMBEDDERS:
-    resolve_into(table_handle[e], ngram_ids[e][0..T], ngram_rows_buf[e])   // pre-sized, reused buffer
-// only after every resolve_into returns: op_embed reads ngram_rows_buf[e] as if it were tok_emb
-```
-
-`resolve_into` (not `prefetch`/`wait`) is the right call here specifically because `AGENTS.md` §1 (no
-heap allocation, no unbounded-latency branch inside a hot compute path) means the *entire* resolve has to
-be a synchronous barrier before compute starts, not something compute checks partway through — exactly
-what `resolve_into`'s contract already promises (§3).
-
-**Concurrency, with a real number attached**: `train_batch` runs `DEFAULT_THREADS` OMP worker threads in
-parallel (`src/backend_cpu.cpp`, `#pragma omp parallel num_threads(DEFAULT_THREADS)`), each processing
-its own window independently — so up to `DEFAULT_THREADS` concurrent `forward()` calls, each issuing its
-own `NGRAM_NUM_EMBEDDERS` `resolve_into` calls, all in flight together. On the reference development
-machine (`[[host-cpu-arrow-lake-hx]]`: 8P+16E cores, no SMT) that's up to ~24 concurrent callers. §3b's
-"many concurrent readers, coalesce same-row requests" requirement is not a nice-to-have here — with a
-real training corpus, adjacent windows share plenty of vocabulary, so concurrent `resolve_into` calls for
-the *same* row across different threads are a real, expected occurrence, not an edge case.
-
-**The strong prefetch opportunity, made concrete**: since a training corpus is fixed and known before
-the run starts (mirroring how this engine already precomputes `corpus.tok` out-of-core — see
-`DESIGN_RATIONALE.md` §2b), the *entire* set of row indices a training run will ever request, across
-every window and every table, is computable in one pass ahead of time, the same shape as the existing
-`corpus.tok`/tokenizer-vocab precompute. The recommended pattern for this consumer is therefore: one
-`prefetch(table_handle[e], ALL row indices this run will ever touch)` + `wait(...)` per table at startup,
-sized so essentially every in-run `resolve_into` call is a warm-tier hit — turning the RAM/disk tiers
-from a reactive cache into a precomputed working set, which is the strongest case Bandana's own sizing
-technique (`PRIOR_ART.md`) has to work with.
-
-### 7b. Decode path (`Model::forward_one()`, one call per generated token)
-
-Structurally different, and honestly harder — flagged as such rather than glossed over. Each decode step
-looks up exactly one row per table (not `T` rows), from a small rolling history of the last
-`NGRAM_MAX_N-1` fed token ids (`docs/NGRAM_EMBEDDING.md`'s decode-path mirror of the training hash). The
-prompt/generation isn't known in advance the way a training corpus is, so §7a's precomputed-working-set
-recipe doesn't apply here — this is squarely the **reactive mode** §1a already names as first-class.
-
-**OPEN — not resolved by this spec as written**: whether a decode-time miss should block
-(`resolve_into` for exactly the current step's single row, accepting whatever latency the coldest tier
-in play adds — tolerable if the miss rate is low and every tier at least as fast as local disk, since
-decode is already a sequential, per-token-latency-bound loop) or fall back to a defined "no signal" value
-matching this engine's own existing convention for out-of-vocabulary/persistent-slot ids (`id_tok = 0`,
-`docs/NGRAM_EMBEDDING.md`'s persistent-slot guard) rather than stall generation waiting on a cold remote
-fetch. **Recommended default for a first implementation**: block via `resolve_into` for the single
-current-step row (simplest, correct, and the natural training-corpus prefetch from §7a should make this
-rare in practice for any vocabulary the training run actually covered) — but this needs an explicit
-per-deployment policy knob eventually, not a silently-assumed answer, since a cold miss against the
-*remote* tier specifically could add real, user-visible latency to interactive generation. **Also open**:
-whether a future speculative-prefetch-during-the-current-step's-compute (predicting likely next-token
-n-grams to warm ahead of the next call) is worth building — the honest finding from the companion design
-doc's own review is that no such overlap currently exists to exploit (n-gram injection happens only at
-the input embedding, so there's no independent per-step compute today to hide I/O latency behind); this
-stays a real future improvement, not a v1 requirement.
-
-### 7c. Data type contract
-
-Sub0Llm's engine computes internally in `float32` (`op_embed` reads `float*` rows directly); the
-motivating real table (`Qwen/Qwen3.8-Flash-Next`'s n-gram embeddings) is stored in `bf16` on disk.
-**Requirement, not left implicit**: `register_table`'s `row_dtype` parameter (§3) must let a caller
-request `resolve_into`/`try_get` hand back **already-dequantized `float32` rows**, not raw on-disk bytes
-requiring a second conversion pass in the caller — i.e. dtype conversion is Sub0Firn's job, performed
-once per row (ideally once ever, at whichever tier first pulls a cold row in, cached converted rather
-than reconverted on every warm hit), not a burden pushed back onto every consumer. This was implicit in
-`row_dtype`'s presence in §3's signature but is worth stating as an explicit, checkable requirement:
-**a consumer should never need to know or care what format the source table was stored in.**
-
-### 7d. What this trace confirms about the API, and what it doesn't yet
-
-Confirmed workable as specified: the `resolve_into`-before-compute pattern, the multi-table-per-call
-shape (one handle per n-gram order/table, matching `ngram_tab[e]`'s real structure), the
-many-concurrent-readers requirement (real number attached: ~24 on the reference machine), and the
-precomputed-working-set mode's fit to training. **Not yet resolved, carried forward as real open items**:
-§7b's decode-time miss policy, and (noted but not solved here) exactly how a caller supplies the
-offset-resolution callback for a *specific* real external format like the Qwen n-gram table's 128-shard
-safetensors layout — §3's `local_sharded`/`remote_http_range` descriptors name the shape of that contract
-but a reference implementation of the callback itself (reusing the extraction logic already proven in
-Sub0Llm's `docs/QWEN4_PREVIEW_REFERENCE.md` Stage 1) doesn't exist yet in either repo.
