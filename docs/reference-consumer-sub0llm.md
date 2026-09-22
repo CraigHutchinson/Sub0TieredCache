@@ -14,7 +14,7 @@ be expressed through the API as specified, the API is wrong, not the consumer.
 Today's code computes `NGRAM_NUM_EMBEDDERS` small tables (a real worked example from Sub0Llm's
 `docs/NGRAM_EMBEDDING.md` §6: `D_MODEL=448, NGRAM_MAX_N=3, K=2` → 4 tables), each looked up `SEQ_LEN`
 times (one row per sequence position, up to 512 in a production build) — i.e. every `forward()` call
-computes `NGRAM_NUM_EMBEDDERS × SEQ_LEN` row indices (cheaply, in Sub0Llm's own code — Sub0Firn never
+computes `NGRAM_NUM_EMBEDDERS × SEQ_LEN` row indices (cheaply, in Sub0Llm's own code — Sub0TieredCache never
 sees the hash, per R1) and needs that many rows resolved before `op_embed` can run. Mapped directly onto
 the API surface:
 

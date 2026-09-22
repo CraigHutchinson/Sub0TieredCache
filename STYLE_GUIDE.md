@@ -1,6 +1,6 @@
-# Sub0Firn Code Style Guide
+# Sub0TieredCache Code Style Guide
 
-Sub0Firn originated inside [Sub0Llm](https://github.com/CraigHutchinson/Sub0Llm) (see
+Sub0TieredCache originated inside [Sub0Llm](https://github.com/CraigHutchinson/Sub0Llm) (see
 `docs/tiered-storage-design.md`'s origin note), so its naming follows Sub0Llm's own observed
 conventions rather than a different sibling project's — there is no single "Sub0 house style" across
 the family (`Sub0Log`, for instance, follows `Sub0Pipeline`'s own, different convention), so this
@@ -8,7 +8,7 @@ document is self-contained rather than a deltas-only note.
 
 ## Naming
 
-- **Namespace**: lowercase, unnested — `sub0firn::` (a sibling of `sub0::`, not nested inside it; see
+- **Namespace**: lowercase, unnested — `Sub0TieredCache::` (a sibling of `sub0::`, not nested inside it; see
   `README.md`'s naming section for why).
 - **Types**: `PascalCase` — e.g. `TableHandle`, `PrefetchTicket`, `RowView`.
 - **Free functions**: `snake_case` — e.g. `register_table`, `resolve_into`, `try_get`. Matches every
@@ -32,7 +32,7 @@ read cleanly.
 No header may contain an unconditional `#include <windows.h>`, POSIX-only header, or platform-specific
 syscall without an `#if`-guarded portable abstraction on every other platform. A change that only compiles
 on the author's own platform is not done — R8 exists specifically because this project's motivating
-first consumer (Sub0Llm) is Windows-first, and Sub0Firn deliberately is not; a portability regression
+first consumer (Sub0Llm) is Windows-first, and Sub0TieredCache deliberately is not; a portability regression
 here undoes the entire reason this is a separate project.
 
 ## Comment and citation discipline

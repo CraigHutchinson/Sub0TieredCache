@@ -1,4 +1,4 @@
-# Agent instructions for Sub0Firn
+# Agent instructions for Sub0TieredCache
 
 This file is a pre-flight checklist, not a tutorial — the same role
 [Sub0Llm's own `AGENTS.md`](https://github.com/CraigHutchinson/Sub0Llm/blob/main/AGENTS.md) plays there,
@@ -31,7 +31,7 @@ looks domain-specific, it belongs in the caller's own adapter code, not here.
 ## 3. Portability is checked on all three platforms, not compiled on one (R8)
 
 See `STYLE_GUIDE.md`. A change that only builds/behaves correctly on the author's own OS is not done.
-This is a harder rule for Sub0Firn than it would be for a typical library, because the motivating first
+This is a harder rule for Sub0TieredCache than it would be for a typical library, because the motivating first
 consumer (Sub0Llm) is Windows-first, and a careless implementer could quietly let Windows-only
 assumptions back in on the theory that "that's what the consumer uses anyway" — that reasoning is exactly
 backwards; it's precisely why this project exists separately.

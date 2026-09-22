@@ -1,6 +1,6 @@
 # Requirements
 
-Normative contract for Sub0Firn. Each requirement below is stated as a testable sentence first, then
+Normative contract for Sub0TieredCache. Each requirement below is stated as a testable sentence first, then
 explained — the sentence is what an implementation is checked against; the explanation is why it says
 that and not something weaker. Sourced from [README.md](README.md)'s scope/API-surface work and the
 real, code-grounded trace against Sub0Llm's own n-gram embeddings consumer
@@ -8,12 +8,12 @@ real, code-grounded trace against Sub0Llm's own n-gram embeddings consumer
 
 ## R1. A caller supplies row indices already computed
 
-"Sub0Firn receives only `(table_id, row_index)` pairs; it does not derive, hash, or interpret how
+"Sub0TieredCache receives only `(table_id, row_index)` pairs; it does not derive, hash, or interpret how
 `row_index` was computed."
 
 Hash formulas, routing decisions, and vocabulary/id derivation are entirely the caller's concern —
 Sub0Llm's own n-gram hash, a MoE router's expert-selection logic, or anything else. Baking any of that
-into Sub0Firn would tie a generic tiered-cache engine to one caller's domain, defeating the reason it's a
+into Sub0TieredCache would tie a generic tiered-cache engine to one caller's domain, defeating the reason it's a
 separate project at all (README §2).
 
 ## R2. Only two calls may block on I/O
@@ -30,7 +30,7 @@ loop than the rest of the API is built around.
 ## R3. An explicit resolve step exists for a hot-path caller to insert ahead of compute
 
 "A caller can populate a pre-sized destination buffer with a full set of resolved rows via one call to
-`resolve_into`, and thereafter read that buffer with zero further calls into Sub0Firn."
+`resolve_into`, and thereafter read that buffer with zero further calls into Sub0TieredCache."
 
 This is the shape a no-heap-allocation, no-branch-on-miss hot path actually needs — resolve everything
 first, compute unconditionally after. `docs/reference-consumer-sub0llm.md` §1 traces this against
@@ -44,7 +44,7 @@ table's next `invalidate` call. There is no TTL-based expiry and no background s
 
 Deliberately scoped to a row's *value*, not to the table's addressable *size* — see "Deferred: a
 table's addressable row range MAY grow" below for why that distinction is load-bearing, not pedantic.
-The tables Sub0Firn serves are either genuinely frozen (an imported checkpoint) or updated only at
+The tables Sub0TieredCache serves are either genuinely frozen (an imported checkpoint) or updated only at
 well-defined bulk boundaries a caller signals explicitly (R1's non-goal already rules out per-row writes)
 — a silent expiry policy would be solving a write-concurrency problem that doesn't exist here, at the
 cost of real unpredictability for the read-only case that's the entire point.
@@ -59,9 +59,9 @@ Sub0Llm's real training path runs up to ~24 concurrent OMP worker threads (`docs
 concurrent fetches for the same hot row are a real, expected occurrence at that concurrency level, not an
 edge case worth deprioritizing.
 
-## R6. Dtype conversion is Sub0Firn's job, performed once
+## R6. Dtype conversion is Sub0TieredCache's job, performed once
 
-"A caller receives rows already converted to the dtype it registered the table with. Sub0Firn performs
+"A caller receives rows already converted to the dtype it registered the table with. Sub0TieredCache performs
 any on-disk-to-requested-dtype conversion itself, cached converted rather than reconverted on every warm
 hit, never pushed back onto the caller as a second pass."
 
@@ -72,7 +72,7 @@ to not duplicate.
 
 ## R7. Format-agnostic core; no embedded knowledge of any specific external file format
 
-"Sub0Firn's tiered-cache core does not parse safetensors, GGUF, or any other specific external weight
+"Sub0TieredCache's tiered-cache core does not parse safetensors, GGUF, or any other specific external weight
 format. A caller supplies an offset-resolution callback (`row_index -> (shard, byte_offset)`); the core
 only ever calls it."
 
@@ -86,13 +86,13 @@ in Sub0Llm — this callback contract, not a shared parser, is the reuse boundar
 `mmap` vs. `MapViewOfFile`) is an internal implementation detail behind a uniform contract, never a
 documented behavioral difference a caller has to branch on."
 
-Sub0Llm itself is Windows-first today; Sub0Firn deliberately is not — the entire reason it's worth
+Sub0Llm itself is Windows-first today; Sub0TieredCache deliberately is not — the entire reason it's worth
 existing as a separate project is that huge sparse lookup tables are a generic problem (README §2), and a
 library that only worked on its first caller's platform wouldn't actually be that.
 
 ## R9. Row content is opaque
 
-"Sub0Firn never validates, interprets, or assigns meaning to a row's bytes beyond its declared width and
+"Sub0TieredCache never validates, interprets, or assigns meaning to a row's bytes beyond its declared width and
 dtype. It is not a vector database (no similarity search), not a training framework (no gradients, no
 optimizer), and not a model-serving system (no concept of a 'layer' or 'checkpoint')."
 
@@ -135,12 +135,12 @@ citations):
 
 - **HugeCTR's dynamic embedding table** (`embedding_vec_size = -1`) genuinely grows at runtime — a new
   key seen during training gets a freshly-initialized row inserted on the spot. This is the closest real
-  precedent for *growth itself*, but it grows via gradient training, which is squarely outside Sub0Firn's
+  precedent for *growth itself*, but it grows via gradient training, which is squarely outside Sub0TieredCache's
   own scope (R9: not a training framework) — cited as evidence the pattern is real and shipped, not as a
   mechanism to reuse directly.
 - **HugeCTR's own Hierarchical Parameter Server (the *inference*-time counterpart of the same project)
   does NOT auto-insert a missing key** — it returns a configured default value instead. This is the
-  closer analog to Sub0Firn's actual role (serving, not training) and is worth taking seriously as a
+  closer analog to Sub0TieredCache's actual role (serving, not training) and is worth taking seriously as a
   reason DR1 should stay opt-in rather than default behavior: an inference-time system silently
   fabricating new "learned" content for an unrecognized key is a correctness trap, not a convenience.
 - **Overlay/union-filesystem composition** (the well-established OS pattern — a read-only lower layer
