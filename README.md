@@ -1,7 +1,7 @@
 # Sub0TieredCache — a tiered cache for huge frozen sparse-lookup tables
 
 Status: **SPEC / REQUIREMENTS DRAFT.** No implementation exists yet, in either Sub0Llm or this repo —
-`include/Sub0TieredCache/Sub0TieredCache.hpp` is a skeleton. This document is the pitch and the concrete API surface;
+`include/sub0tieredcache/sub0tieredcache.hpp` is a skeleton. This document is the pitch and the concrete API surface;
 [REQUIREMENTS.md](REQUIREMENTS.md) is the normative contract an implementation is checked against.
 
 **Documentation map**:
@@ -14,21 +14,14 @@ Status: **SPEC / REQUIREMENTS DRAFT.** No implementation exists yet, in either S
   [reference-consumer-sub0llm.md](docs/reference-consumer-sub0llm.md) (the API traced against Sub0Llm's
   real, already-merged consumer code).
 
-**Name**: **Sub0TieredCache**. *Firn* is the glaciology term for the compacted, intermediate layer of snow
-between fresh powder and solid glacial ice — a real, load-bearing metaphor here, not decoration: a
-Sub0TieredCache cache tier is exactly that intermediate, compacted, partially-settled layer sitting between a
-cold, deep, expensive-to-reach source (the "ice" — the full frozen table on disk or remote storage) and
-the hot, fast, small working surface (the "fresh snow" — VRAM/registers). Keeps the `Sub0` lineage
-naming (`sub0::` is this engine's own C++ namespace) while being clearly its own project, not a Sub0Llm
-submodule.
+**Name**: **Sub0TieredCache** describes caching across memory, local storage and remote tiers.
+It is an independent member of the `Sub0` project family.
 
-- **Repository**: `Sub0TieredCache` (matches the crate/package-name convention most build systems expect —
-  lowercase, no separator).
-- **C++ namespace**: `Sub0TieredCache::` (lowercase, unnested from `sub0::` — a sibling project, not a nested
-  component of it; Sub0Llm's own consuming code lives in `sub0::` and simply depends on `Sub0TieredCache::`
-  types the way it might depend on any other external library).
-- **Library target name**: `libSub0TieredCache` (the conventional Unix `lib`-prefixed static/shared library
-  name; the CMake target itself would be `Sub0TieredCache`).
+- **Repository**: `Sub0TieredCache`.
+- **C++ namespace**: `sub0tieredcache::` (lowercase, a sibling of `sub0::`).
+- **Public include**: `<sub0tieredcache/sub0tieredcache.hpp>`.
+- **CMake target**: `Sub0TieredCache`, with alias `Sub0TieredCache::Sub0TieredCache`.
+  The current scaffold is header-only; it produces no compiled library artifact.
 
 ## 1. Scope
 

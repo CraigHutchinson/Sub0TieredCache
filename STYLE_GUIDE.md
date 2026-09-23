@@ -8,7 +8,7 @@ document is self-contained rather than a deltas-only note.
 
 ## Naming
 
-- **Namespace**: lowercase, unnested — `Sub0TieredCache::` (a sibling of `sub0::`, not nested inside it; see
+- **Namespace**: lowercase, unnested — `sub0tieredcache::` (a sibling of `sub0::`, not nested inside it; see
   `README.md`'s naming section for why).
 - **Types**: `PascalCase` — e.g. `TableHandle`, `PrefetchTicket`, `RowView`.
 - **Free functions**: `snake_case` — e.g. `register_table`, `resolve_into`, `try_get`. Matches every
