@@ -47,7 +47,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib") // CMake also links ws2_32 explicitly on WIN32; belt and braces.
+// ws2_32 is linked by the Sub0TieredCache CMake target on WIN32 (no #pragma comment: MinGW rejects it).
 using sub0tieredcache_socket_t = SOCKET;
 #define SUB0TIEREDCACHE_INVALID_SOCKET INVALID_SOCKET
 #define SUB0TIEREDCACHE_SOCKET_ERROR SOCKET_ERROR

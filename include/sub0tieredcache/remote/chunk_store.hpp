@@ -39,6 +39,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <io.h> // _get_osfhandle
 #else
 #include <unistd.h>
 #endif
