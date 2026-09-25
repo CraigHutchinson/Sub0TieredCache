@@ -16,13 +16,22 @@ jobs:
           - compiler: gcc
             cc: gcc
             cxx: g++
+            extra_configure_args: ""
           - compiler: clang
             cc: clang
             cxx: clang++
+            # Ubuntu's clang + libstdc++ cannot compile <expected> at all: clang reports __cpp_concepts
+            # as the C++20 TS value 201907L rather than 202002L, which gates libstdc++'s <expected> off
+            # entirely (a real toolchain gap, confirmed against Sub0MemPage's own headers too, not a bug
+            # in this project's code). Build against libc++ instead -- see README.md's own note.
+            extra_configure_args: "-DCMAKE_CXX_FLAGS=-stdlib=libc++ -DCMAKE_EXE_LINKER_FLAGS=-stdlib=libc++"
     steps:
       - uses: actions/checkout@v4
+      - name: Install libc++ (clang + libstdc++'s <expected> gap)
+        if: matrix.compiler == 'clang'
+        run: sudo apt-get update && sudo apt-get install -y libc++-18-dev libc++abi-18-dev
       - name: Configure
-        run: cmake --preset ci-unix
+        run: cmake --preset ci-unix ${{ matrix.extra_configure_args }}
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}

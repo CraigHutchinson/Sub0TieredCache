@@ -25,30 +25,58 @@
  *
  *        Free --admit--> Filling --ok--> Ready --evict (unpinned only)--> Free
  *                            |
- *                            +--error/short/codec-fail--> Free, or Failed while pins > 0
- *                                                          (Failed --last unpin--> Free)
+ *                            +--error/short/codec-fail--> Failed (unindexed immediately, see below)
+ *                                                          --reclaimed (pins==0, by claim_victim)--> Free
  *
  *    Filling is never an eviction victim regardless of pins (mirrors SlotPool's claim_victim, which
- *    skips any non-ready state outright) -- this is what "never evicts leased/filling rows" means.
- *  - Coalescing (R5): the thread that finds a slot Free becomes its *finisher* -- it submits the
- *    transport request, blocks on it (finishers only ever run from resolve_into/wait, both allowed to
- *    block by R2), runs the codec if this table converts, and publishes Ready/Failed. Every other
- *    thread that finds the same slot Filling just waits on the table's own condition variable for the
- *    state to leave Filling; nobody else calls into the transport for that row, so exactly one live
- *    fetch exists per (row, generation) at a time.
+ *    skips any non-ready/non-failed state outright) -- this is what "never evicts leased/filling rows"
+ *    means. A terminal failure erases the slot's (row, generation) index entry immediately (R14's "reads
+ *    repeated after failure are allowed" -- a later, independent request for the same row must retry,
+ *    not see a stale failure), while the slot itself stays Failed, still reachable by any lease that
+ *    already captured its (slot, epoch), until claim_victim reclaims it once unpinned.
+ *  - Coalescing (R5): the thread that admits a Free slot becomes its *finisher* -- it submits the
+ *    transport request, blocks on it, runs the codec if this table converts, and publishes Ready/Failed.
+ *    Every other thread that finds the same slot Filling just waits on the table's own condition
+ *    variable for the state to leave Filling; nobody else calls into the transport for that row, so
+ *    exactly one live fetch exists per (row, generation) at a time. `resolve_into`/`wait` become the
+ *    finisher inline (for latency), but a fill nobody ever waits on -- a dropped prefetch ticket, or a
+ *    fill left behind by a `resolve_into` batch that failed admission on a later row -- still needs a
+ *    finisher: every Table runs one internal completion worker thread (started in create(), stopped and
+ *    joined administratively in the destructor) that picks up any Filling slot nobody has claimed yet.
+ *    This is a per-table administrative resource, not a hot-path cost -- see `worker_loop`.
  *  - try_get (R11) only ever reads state==Ready: it never touches the transport claim, never runs a
  *    codec, and never blocks -- a Filling row is reported as a miss even if the raw bytes already
  *    arrived, because publishing still requires the codec step this call is forbidden from doing.
+ *  - `resolve_into` overlaps I/O across its own batch (docs/integration-plan.md's "Output and cache
+ *    contract", the reference-consumer resolve-before-compute loop): phase A admits and pins every row
+ *    under one lock, submitting every miss's transport request without waiting for any of them; phase B
+ *    then drives or awaits each admitted row to a terminal state. A phase-A admission failure unwinds
+ *    only the pins this call took -- fills already submitted for other rows in the same call are left
+ *    running for the completion worker (or a later caller) to finish, never force-failed or leaked.
+ *  - Generations bind to an immutable *source*, not just a number (R4, docs/integration-plan.md
+ *    "Versioning and remote tier": "the caller provides a new immutable source snapshot"). `invalidate`
+ *    therefore takes a new SourceId/extent/resolver and builds new sub0mempage::TransferSet(s) for it; a
+ *    slot still Filling under the OLD binding keeps running against the old TransferSet(s) it already
+ *    submitted through (a Claim is self-contained -- it doesn't care which binding is "current"), and
+ *    the old binding is torn down only once nothing is still in flight on it. At most one binding is
+ *    "retiring" at a time; invalidating again while it still has in-flight fills reports Status::busy
+ *    rather than losing track of a live transfer (R4's "reject the transition explicitly").
  *  - Transport ownership: identity-representation tables submit straight into the cache's own output
- *    reservation via one `sub0mempage::TransferSet` (the explicit-destination mode -- docs/transfer-
- *    contract.md "Two uses of one transfer scheduler"). Converting tables read raw encoded bytes into a
- *    second, small, bounded TransferSet ("scratch"), run the codec into the output reservation, then
- *    release the scratch claim -- never retaining an unowned source pointer past the codec call (R6).
+ *    reservation via one `sub0mempage::TransferSet` per binding (the explicit-destination mode --
+ *    docs/transfer-contract.md "Two uses of one transfer scheduler"). Converting tables read raw encoded
+ *    bytes into a second, small, bounded TransferSet ("scratch"), run the codec into the output
+ *    reservation, then release the scratch claim -- never retaining an unowned source pointer past the
+ *    codec call (R6). The current and retiring bindings' TransferSets are two separate MemPage objects
+ *    registered over the SAME output/scratch destination spans; this is safe only because Table itself
+ *    is the sole authority over which slot (and thus which destination byte range) is live at any time --
+ *    see docs/integration-plan.md's "Contract feedback to Sub0MemPage (T0)" for why this is flagged as an
+ *    R18 cross-instance item rather than quietly relied upon.
  *
  *  Allocation: everything the hot paths touch (slots_, the row index, ticket/waiter tables, the scratch
  *  free-list) is sized once in Table::create(); try_get and a resolve_into that only hits already-Ready
  *  rows perform no heap allocation (verified in tests/allocation_tests.cpp, mirroring Sub0MemPage's own
- *  gate).
+ *  gate). `invalidate` is administrative and may allocate (it builds new TransferSet objects) -- it does
+ *  not itself touch I/O or block on a transfer.
  */
 
 #include "codec.hpp"
@@ -68,6 +96,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -91,6 +120,8 @@ enum class Representation : std::uint8_t {
  *  non-owning context, not std::function, so resolving a row's extent never allocates. The callback
  *  itself must be prevalidated/bounded pure address arithmetic (AGENTS.md sec 2) -- it is called with no
  *  table lock held, but from a thread that may go on to block on I/O, so it must not itself block.
+ *  Default-constructed is "invalid" (`valid() == false`); `invalidate()` uses that to mean "keep the
+ *  current resolver".
  */
 class RowExtentResolverRef {
 public:
@@ -159,7 +190,8 @@ private:
 };
 
 /// Move-only handle on a prefetch batch. Names which rows to observe with wait(); dropping it early
-/// does not cancel anything in flight (mirrors sub0mempage::Ticket).
+/// does not cancel anything in flight (mirrors sub0mempage::Ticket). A dropped, never-waited ticket's
+/// fills are still driven to completion by the table's own completion worker.
 class PrefetchTicket {
 public:
     PrefetchTicket() noexcept = default;
@@ -204,15 +236,17 @@ struct TableStats {
     std::uint64_t failed = 0;          ///< Terminal transport/codec failures observed.
 };
 
-/// Registration parameters for one table (an administrative call: may allocate, may block).
+/// Registration parameters for one table (an administrative call: may allocate, may block). `source`,
+/// `source_bytes`, `generation` and `resolve_extent` seed the table's *initial* binding; later bindings
+/// come from invalidate()'s own arguments, not from re-reading this struct.
 struct TableConfig {
     std::uint64_t row_count = 0;              ///< Addressable row_index range is [0, row_count).
     std::uint64_t source_row_bytes = 0;       ///< Encoded row width the adapter's extents must have.
     std::uint64_t output_row_bytes = 0;       ///< Published row width (== source_row_bytes iff identity).
     Representation representation = Representation::identity;
     Codec* codec = nullptr;                   ///< Required iff representation == custom; unused otherwise.
-    sub0mempage::SourceId source{};           ///< MemPage source identity for the current generation.
-    std::uint64_t source_bytes = 0;           ///< Total addressable extent of that source.
+    sub0mempage::SourceId source{};           ///< MemPage source identity for the initial binding.
+    std::uint64_t source_bytes = 0;           ///< Total addressable extent of that initial source.
     std::uint64_t generation = 0;             ///< Initial source generation (R4).
     RowExtentResolverRef resolve_extent;      ///< row_index -> encoded ByteRange (R1, R7).
     std::span<std::byte> output_storage;      ///< Caller-owned; size == budget_rows * output_row_bytes.
@@ -254,7 +288,8 @@ namespace detail {
  *
  *  Non-movable (it is the identity every RowLease/PrefetchTicket points back to), hence create() returns
  *  a unique_ptr. Destroying a table with outstanding leases, tickets or in-flight fetches terminates
- *  (mirrors Sub0MemPage's SlotPool/TransferSet exactly): drain() first on an administrative path.
+ *  (mirrors Sub0MemPage's SlotPool/TransferSet exactly): drain() first on an administrative path. The
+ *  destructor also stops and joins the internal completion worker before checking those invariants.
  */
 class Table {
     struct Passkey {};
@@ -269,17 +304,25 @@ public:
     ~Table();
 
     /** @brief Hint: start fetches for every row in `rows` not already Ready. Never blocks on I/O (R2).
-     *  Does not pin anything -- "a prefetch ticket ... is not a row pin" (docs/integration-plan.md).
+     *  Does not pin anything -- "a prefetch ticket ... is not a row pin" (docs/integration-plan.md). A
+     *  dropped ticket's fills are still driven to completion by the table's completion worker.
      */
     [[nodiscard]] std::expected<PrefetchTicket, Status> prefetch(std::span<const std::uint64_t> rows) noexcept;
 
     /// Blocks until every row the ticket names is terminal (or evicted/reclaimed) or `deadline` passes.
-    /// Observes only; does not pin (R2 allows this call to block).
+    /// Observes only; does not pin (R2 allows this call to block). If this call becomes a row's finisher
+    /// and `deadline` passes before the underlying transfer completes, that row is reported pending and
+    /// left Filling for a later caller or the completion worker to finish.
     [[nodiscard]] WaitOutcome wait(const PrefetchTicket& ticket, Deadline deadline = std::nullopt) noexcept;
 
     /** @brief Pin every row of `rows` in order, fetching/converting misses, and block until all are
-     *  ready (R2, R3). All-or-nothing (R14): on any failure no lease from this call is left held.
-     *  Duplicates in `rows` are honoured (each gets its own lease on the same underlying slot).
+     *  ready (R2, R3). All-or-nothing (R14): on any failure no lease from this call is left held. Two
+     *  phases: phase A admits and pins every row under one lock, submitting every miss's transport
+     *  request without waiting on any of them (so the batch's own fetches overlap); phase B then drives
+     *  or awaits each admitted row. A phase-A failure unwinds only this call's own pins -- fills already
+     *  submitted for other rows in the same call keep running (the completion worker finishes them).
+     *  Duplicates in `rows` are honoured (each gets its own lease on the same underlying slot) and cause
+     *  exactly one fetch.
      *  @param out Receives one lease per row in request order; must hold at least `rows.size()`. Leases
      *             already held in the entries this call writes are released first.
      *  @return Number of leases written (always rows.size() on success).
@@ -291,21 +334,31 @@ public:
     /// generation; a row still filling is reported as a miss, not awaited.
     [[nodiscard]] std::optional<RowLease> try_get(std::uint64_t row_index) noexcept;
 
-    /** @brief Administrative generation transition (R4). New requests bind to `new_generation`
-     *  immediately; already-resident rows keep their captured generation until evicted or explicitly
-     *  drained, so old leases stay valid. Never blocks, never allocates, always succeeds -- budget
-     *  conflicts between the two live generations are NOT rejected here (this call cannot know the
-     *  future access pattern); they surface where R4 actually requires them to: a resolve_into/prefetch
-     *  that cannot make room (every candidate victim is pinned or itself Filling) reports
-     *  Status::pool_exhausted from that call, exactly as an ordinary single-generation exhaustion would.
-     *  This is a deliberate design choice, not an oversight -- see this file's own tests
-     *  (test_generation_budget_conflict_is_rejected in tests/row_cache_tests.cpp) for the case it covers.
+    /** @brief Administrative generation transition (R4, docs/integration-plan.md "Versioning and remote
+     *  tier": invalidation publishes a new immutable source *snapshot*, not just a new number). New
+     *  requests bind to `new_generation` reading from `new_source`/`new_source_bytes` via `new_resolver`
+     *  (or the current resolver, if `new_resolver` is default-constructed/invalid); already-resident
+     *  rows keep their captured generation and binding until evicted, so old leases stay valid and old
+     *  in-flight fills keep reading from the old source. May allocate (it builds new
+     *  sub0mempage::TransferSet objects for the new binding) but never touches I/O itself.
+     *
+     *  At most one binding may be "retiring" (superseded but still draining in-flight fills) at a time:
+     *  calling this again while the previous retiring binding still has fills in flight returns
+     *  Status::busy without changing anything, rather than losing track of a live transfer or silently
+     *  overcommitting (R4's "reject the transition explicitly"). Budget conflicts between the current and
+     *  a retiring generation are NOT rejected here either (future access pattern is unknowable); they
+     *  surface where R4 actually requires them to: a resolve_into/prefetch that cannot make room (every
+     *  candidate victim is pinned or itself Filling) reports Status::pool_exhausted from that call,
+     *  exactly as an ordinary single-generation exhaustion would -- see
+     *  test_generation_budget_conflict_is_rejected in tests/row_cache_tests.cpp.
      */
-    void invalidate(std::uint64_t new_generation) noexcept;
+    [[nodiscard]] Status invalidate(std::uint64_t new_generation, sub0mempage::SourceId new_source,
+                                     std::uint64_t new_source_bytes,
+                                     RowExtentResolverRef new_resolver = {}) noexcept;
 
     [[nodiscard]] TableStats stats() const noexcept;
 
-    /// Administrative: blocks until no fetch is in flight anywhere in this table.
+    /// Administrative: blocks until no fetch is in flight anywhere in this table (either binding).
     [[nodiscard]] Status drain(Deadline deadline = std::nullopt) noexcept;
 
 private:
@@ -316,6 +369,21 @@ private:
 
     enum class SlotState : std::uint8_t { free, filling, ready, failed };
 
+    /// One immutable-source binding: the SourceId/extent/resolver a fill reads through, plus the
+    /// TransferSet(s) submitted fills actually run on. Table keeps at most a "current" and one
+    /// "retiring" binding alive at once (see invalidate()). Heap-allocated (via unique_ptr, not a plain
+    /// member) so a raw Binding* captured by an in-flight Slot stays valid across invalidate() moving
+    /// which unique_ptr "current"/"retiring" point at -- only the pointee's lifetime matters, and it
+    /// never moves once created.
+    struct Binding {
+        sub0mempage::SourceId source{};
+        std::uint64_t source_bytes = 0;
+        RowExtentResolverRef resolver;
+        std::unique_ptr<sub0mempage::TransferSet> row_transfer;     // identity: straight into output_storage
+        std::unique_ptr<sub0mempage::TransferSet> scratch_transfer; // conversion only; null iff identity
+        std::uint32_t in_flight = 0; ///< Slots currently Filling under this exact binding.
+    };
+
     struct Slot {
         std::uint64_t row_index = 0;
         std::uint64_t row_generation = 0;
@@ -325,6 +393,8 @@ private:
         Status failure = Status::ok;
         bool referenced = false;  ///< CLOCK second-chance bit; set by resolve_into/try_get hits.
         bool finishing = false;   ///< Some thread already owns driving this fill to a terminal state.
+        bool indexed = false;     ///< Whether (row_index, row_generation) currently points at this slot.
+        Binding* fill_binding = nullptr; ///< Non-owning; which binding's in_flight counter to release.
         std::optional<sub0mempage::Claim> claim; ///< Live only while state == filling.
         std::uint32_t scratch_slot = NONE;       ///< Valid only while converting and state == filling.
     };
@@ -350,19 +420,26 @@ private:
 
     [[nodiscard]] std::uint32_t claim_victim() noexcept;
     void make_free(std::uint32_t slot) noexcept;
+    /// Erases the slot's index entry (if any) without changing its state -- used on terminal failure so
+    /// a fresh request for the same row retries instead of observing a stale failure (R14), while a
+    /// lease that already captured (slot, epoch) can still read Status::failure through it.
+    void unindex_locked(std::uint32_t slot) noexcept;
     void unpin_locked(std::uint32_t slot) noexcept;
     void release_lease(std::uint32_t slot, std::uint32_t epoch) noexcept;
     void discard_ticket(std::uint32_t record, std::uint32_t generation) noexcept;
 
-    /// Admits `slot` for (row_index, current_generation_), transitions it to Filling, submits the
-    /// transport fetch (never blocks) and stores the Claim for a later finisher. Called under lock_.
+    /// Admits `slot` for (row_index, current_generation_) against the CURRENT binding, transitions it to
+    /// Filling, submits the transport fetch (never blocks) and stores the Claim for a later finisher.
+    /// Called under lock_. On any failure the slot is left Failed-and-unindexed (never left dangling).
     [[nodiscard]] Status start_fill_locked(std::uint32_t slot, std::uint64_t row_index) noexcept;
 
-    /// Drives a Filling slot to a terminal state: blocks on its Claim, runs the codec if converting,
-    /// publishes Ready/Failed. Called by exactly one thread per fill (guarded by Slot::finishing),
-    /// WITHOUT lock_ held, then re-locks to publish. May block on I/O (only reached from resolve_into
-    /// or wait, both allowed to by R2).
-    void finish_fill(std::uint32_t slot) noexcept;
+    /// Drives a Filling slot to a terminal state: blocks on its Claim (up to `deadline`), runs the codec
+    /// if converting, publishes Ready/Failed. Called by exactly one thread per fill (guarded by
+    /// Slot::finishing), WITHOUT lock_ held, then re-locks to publish. If `deadline` passes first, the
+    /// claim (and the underlying transfer) stays live: this call just relinquishes `finishing` so a later
+    /// caller or the completion worker can retry. May block on I/O (only reached from resolve_into,
+    /// wait, or the completion worker -- never from try_get/prefetch, matching R2).
+    void finish_fill(std::uint32_t slot, Deadline deadline = std::nullopt) noexcept;
 
     /// Pins a row (fetching if necessary, becoming finisher inline if nobody else is). Blocking.
     [[nodiscard]] std::expected<RowLease, Status> resolve_one(std::uint64_t row_index) noexcept;
@@ -373,20 +450,30 @@ private:
     [[nodiscard]] std::uint32_t acquire_scratch() noexcept;
     void release_scratch(std::uint32_t index) noexcept;
 
+    /// The completion worker's body (docs/integration-plan.md's coalescing note above): repeatedly finds
+    /// a Filling, unclaimed slot and drives it to completion, sleeping on progress_ when there is none.
+    /// A per-table administrative thread, started in the constructor and joined in the destructor.
+    void worker_loop() noexcept;
+    [[nodiscard]] std::uint32_t find_unclaimed_filling_locked() const noexcept;
+    void stop_worker() noexcept;
+
     [[nodiscard]] std::span<std::byte> output_span(std::uint32_t slot) const noexcept {
         return config_.output_storage.subspan(std::size_t{slot} * config_.output_row_bytes, config_.output_row_bytes);
     }
     [[nodiscard]] std::span<std::byte> scratch_span(std::uint32_t index) const noexcept {
         return config_.scratch_storage.subspan(std::size_t{index} * config_.source_row_bytes, config_.source_row_bytes);
     }
+    [[nodiscard]] std::unique_ptr<Binding> make_binding(sub0mempage::SourceId source, std::uint64_t source_bytes,
+                                                        RowExtentResolverRef resolver,
+                                                        Status& error) noexcept;
 
     TableConfig config_;
     sub0mempage::FillBackendRef backend_;
     Bf16ToF32Codec builtin_bf16_codec_;
     Codec* active_codec_ = nullptr; // nullptr iff identity (no codec step)
 
-    std::unique_ptr<sub0mempage::TransferSet> row_transfer_;     // identity: reads straight into output_storage
-    std::unique_ptr<sub0mempage::TransferSet> scratch_transfer_; // conversion: reads raw bytes into scratch_storage
+    std::unique_ptr<Binding> current_binding_;
+    std::unique_ptr<Binding> retiring_binding_; // null iff no superseded binding is still draining
 
     std::vector<Slot> slots_;
     std::vector<std::uint32_t> index_; ///< (row_index, generation) -> slot, open addressing.
@@ -398,15 +485,18 @@ private:
     std::uint64_t current_generation_ = 0;
     std::uint32_t pins_total_ = 0;
     std::uint32_t tickets_held_ = 0;
-    std::uint32_t in_flight_ = 0;
+    std::uint32_t in_flight_ = 0; ///< Sum of both bindings' in_flight (drain()/~Table's own view).
     std::uint32_t non_free_ = 0;
     TableStats counters_;
 
     mutable std::mutex lock_;
-    std::condition_variable progress_; ///< Signalled whenever any slot leaves Filling.
+    std::condition_variable progress_; ///< Signalled whenever any slot changes state or is admitted.
 
     std::mutex scratch_lock_;
     std::vector<bool> scratch_used_;
+
+    bool worker_stopping_ = false;
+    std::thread worker_;
 };
 
 /// A named collection of independently registered tables (the "register_table"-shaped entry point --
@@ -436,6 +526,7 @@ public:
     [[nodiscard]] const Table* table(TableHandle handle) const noexcept {
         return handle < tables_.size() ? tables_[handle].get() : nullptr;
     }
+    [[nodiscard]] std::size_t table_count() const noexcept { return tables_.size(); }
 
 private:
     std::vector<std::unique_ptr<Table>> tables_;
@@ -525,7 +616,45 @@ inline std::expected<std::unique_ptr<Table>, Status> Table::create(const TableCo
             return std::unexpected(Status::invalid_argument);
         }
     }
-    return std::make_unique<Table>(Passkey{}, config, backend);
+    auto table = std::make_unique<Table>(Passkey{}, config, backend);
+    if (table->current_binding_ == nullptr) {
+        return std::unexpected(Status::invalid_argument); // the initial binding itself failed to construct
+    }
+    return table;
+}
+
+inline std::unique_ptr<Table::Binding> Table::make_binding(sub0mempage::SourceId source, std::uint64_t source_bytes,
+                                                            RowExtentResolverRef resolver, Status& error) noexcept {
+    if (source_bytes == 0) {
+        error = Status::invalid_argument;
+        return nullptr;
+    }
+    auto binding = std::make_unique<Binding>();
+    binding->source = source;
+    binding->source_bytes = source_bytes;
+    binding->resolver = resolver;
+    auto row_transfer = sub0mempage::TransferSet::create(
+        {.source = source, .source_bytes = source_bytes, .destination = config_.output_storage,
+         .max_claims = config_.budget_rows},
+        backend_);
+    if (!row_transfer) {
+        error = detail::from_mempage(row_transfer.error());
+        return nullptr;
+    }
+    binding->row_transfer = std::move(*row_transfer);
+    if (active_codec_ != nullptr) {
+        auto scratch_transfer = sub0mempage::TransferSet::create(
+            {.source = source, .source_bytes = source_bytes, .destination = config_.scratch_storage,
+             .max_claims = config_.scratch_rows},
+            backend_);
+        if (!scratch_transfer) {
+            error = detail::from_mempage(scratch_transfer.error());
+            return nullptr;
+        }
+        binding->scratch_transfer = std::move(*scratch_transfer);
+    }
+    error = Status::ok;
+    return binding;
 }
 
 inline Table::Table(Passkey, const TableConfig& config, sub0mempage::FillBackendRef backend)
@@ -543,26 +672,34 @@ inline Table::Table(Passkey, const TableConfig& config, sub0mempage::FillBackend
                    : config_.representation == Representation::bf16_to_f32 ? &builtin_bf16_codec_
                                                                             : config_.codec;
 
-    // Identity rows land straight in the output reservation (no second, lower cache -- docs/transfer-
-    // contract.md "Two uses of one transfer scheduler"). Converting tables additionally need a bounded
-    // raw-byte staging area, read once per fetch and released the moment the codec finishes with it.
-    row_transfer_ = std::move(*sub0mempage::TransferSet::create(
-        {.source = config_.source,
-         .source_bytes = config_.source_bytes,
-         .destination = config_.output_storage,
-         .max_claims = config_.budget_rows},
-        backend_));
-    if (active_codec_ != nullptr) {
-        scratch_transfer_ = std::move(*sub0mempage::TransferSet::create(
-            {.source = config_.source,
-             .source_bytes = config_.source_bytes,
-             .destination = config_.scratch_storage,
-             .max_claims = config_.scratch_rows},
-            backend_));
+    Status error = Status::ok;
+    current_binding_ = make_binding(config_.source, config_.source_bytes, config_.resolve_extent, error);
+    // create() checks current_binding_ != nullptr and reports invalid_argument; nothing else to do here.
+
+    // The completion worker (see the file comment's coalescing note) is started last, once every other
+    // member is fully constructed -- it immediately starts touching lock_/slots_/current_binding_.
+    worker_ = std::thread(&Table::worker_loop, this);
+}
+
+inline void Table::stop_worker() noexcept {
+    {
+        const std::scoped_lock lock(lock_);
+        if (worker_stopping_) {
+            return;
+        }
+        worker_stopping_ = true;
+    }
+    progress_.notify_all();
+    if (worker_.joinable()) {
+        worker_.join();
     }
 }
 
 inline Table::~Table() {
+    // Stop the worker before checking invariants: it must not still be touching slots_ concurrently, and
+    // joining it is only quick if every fill it might be blocked inside claim->wait() for has already
+    // terminated -- i.e. the caller drained (and completed its backend) first, per drain()'s own contract.
+    stop_worker();
     const std::scoped_lock lock(lock_);
     if (in_flight_ != 0 || pins_total_ != 0 || tickets_held_ != 0) {
         // A finisher could still be writing into caller storage, or a lease/ticket would dangle.
@@ -628,7 +765,9 @@ inline void Table::index_erase(std::uint64_t row_index, std::uint64_t generation
 /// made and cited one layer down; re-picking a different one here for no reason would be the scope
 /// violation, not reusing it). Filling slots are skipped unconditionally, matching "never evicts
 /// leased/filling rows": a state check, not a pins check, because a Filling slot may have zero pins
-/// (a prefetch that nobody has waited on yet) and must still never be reclaimed mid-write.
+/// (a prefetch that nobody has waited on yet) and must still never be reclaimed mid-write. A Failed,
+/// unpinned slot is reclaimed immediately and unconditionally (no second-chance bit): it is already
+/// unindexed (unindex_locked, called the moment it failed) and holds nothing worth keeping.
 inline std::uint32_t Table::claim_victim() noexcept {
     const std::uint32_t n = static_cast<std::uint32_t>(slots_.size());
     for (std::uint32_t step = 0; step < 2 * n; ++step) {
@@ -638,9 +777,14 @@ inline std::uint32_t Table::claim_victim() noexcept {
         if (candidate.state == SlotState::free) {
             return slot;
         }
-        if (candidate.state != SlotState::ready || candidate.pins != 0) {
+        if (candidate.pins != 0 || candidate.state == SlotState::filling) {
             continue;
         }
+        if (candidate.state == SlotState::failed) {
+            make_free(slot);
+            return slot;
+        }
+        // candidate.state == ready
         if (candidate.referenced) {
             candidate.referenced = false;
             continue;
@@ -652,11 +796,17 @@ inline std::uint32_t Table::claim_victim() noexcept {
     return NONE;
 }
 
+inline void Table::unindex_locked(std::uint32_t slot) noexcept {
+    Slot& s = slots_[slot];
+    if (s.indexed) {
+        index_erase(s.row_index, s.row_generation);
+        s.indexed = false;
+    }
+}
+
 inline void Table::make_free(std::uint32_t slot) noexcept {
     Slot& s = slots_[slot];
-    if (s.state == SlotState::filling || s.state == SlotState::ready || s.state == SlotState::failed) {
-        index_erase(s.row_index, s.row_generation);
-    }
+    unindex_locked(slot);
     if (s.state != SlotState::free) {
         --non_free_;
     }
@@ -664,6 +814,7 @@ inline void Table::make_free(std::uint32_t slot) noexcept {
     s.referenced = false;
     s.claim.reset();
     s.scratch_slot = NONE;
+    s.fill_binding = nullptr;
 }
 
 inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_index) noexcept {
@@ -675,27 +826,31 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
     s.failure = Status::ok;
     s.finishing = false;
     s.scratch_slot = NONE;
+    s.fill_binding = current_binding_.get();
     index_insert(row_index, current_generation_, slot);
+    s.indexed = true;
     non_free_ = std::min(static_cast<std::uint32_t>(slots_.size()), non_free_ + 1);
 
-    const auto extent = config_.resolve_extent.resolve(row_index);
-    if (!extent) {
+    const auto fail = [&](Status status) noexcept {
         s.state = SlotState::failed;
-        s.failure = extent.error();
-        return extent.error();
+        s.failure = status;
+        unindex_locked(slot); // R14: a later, independent request for this row must retry, not see this
+        s.fill_binding = nullptr;
+        return status;
+    };
+
+    const auto extent = current_binding_->resolver.resolve(row_index);
+    if (!extent) {
+        return fail(extent.error());
     }
     if (extent->length != config_.source_row_bytes) {
-        s.state = SlotState::failed;
-        s.failure = Status::invalid_argument;
-        return Status::invalid_argument;
+        return fail(Status::invalid_argument);
     }
 
     if (active_codec_ == nullptr) {
-        auto claim = row_transfer_->submit(*extent, std::uint64_t{slot} * config_.output_row_bytes);
+        auto claim = current_binding_->row_transfer->submit(*extent, std::uint64_t{slot} * config_.output_row_bytes);
         if (!claim) {
-            s.state = SlotState::failed;
-            s.failure = detail::from_mempage(claim.error());
-            return s.failure;
+            return fail(detail::from_mempage(claim.error()));
         }
         s.claim = std::move(*claim);
     } else {
@@ -703,26 +858,24 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
         // while waiting for a release that itself needs lock_ (see acquire_scratch's own comment).
         const std::uint32_t scratch = acquire_scratch();
         if (scratch == NONE) {
-            s.state = SlotState::failed;
-            s.failure = Status::pool_exhausted;
-            return Status::pool_exhausted;
+            return fail(Status::pool_exhausted);
         }
-        auto claim = scratch_transfer_->submit(*extent, std::uint64_t{scratch} * config_.source_row_bytes);
+        auto claim = current_binding_->scratch_transfer->submit(*extent, std::uint64_t{scratch} * config_.source_row_bytes);
         if (!claim) {
             release_scratch(scratch);
-            s.state = SlotState::failed;
-            s.failure = detail::from_mempage(claim.error());
-            return s.failure;
+            return fail(detail::from_mempage(claim.error()));
         }
         s.scratch_slot = scratch;
         s.claim = std::move(*claim);
     }
     ++in_flight_;
+    ++current_binding_->in_flight;
     ++counters_.fetches;
+    progress_.notify_all(); // wake the completion worker (and any waiter re-checking state) promptly
     return Status::ok;
 }
 
-inline void Table::finish_fill(std::uint32_t slot) noexcept {
+inline void Table::finish_fill(std::uint32_t slot, Deadline deadline) noexcept {
     std::unique_lock lock(lock_);
     Slot& s = slots_[slot];
     if (s.state != SlotState::filling) {
@@ -733,7 +886,16 @@ inline void Table::finish_fill(std::uint32_t slot) noexcept {
     const std::uint32_t scratch = s.scratch_slot;
     lock.unlock();
 
-    const sub0mempage::Status raw_status = claim->wait();
+    const sub0mempage::Status raw_status = claim->wait(deadline);
+    if (raw_status == sub0mempage::Status::timeout) {
+        // The transfer and its claim/reservation are still live (transfer-contract.md: "timeout leaves
+        // the transfer live"). Relinquish finishing so a later wait()/resolve_into call, or the
+        // completion worker, retries the wait later -- never mark this terminal on a mere deadline.
+        lock.lock();
+        s.finishing = false;
+        progress_.notify_all();
+        return;
+    }
     Status result = detail::from_mempage(raw_status);
     if (result == Status::ok && converting) {
         if (active_codec_->convert(claim->bytes(), output_span(slot))) {
@@ -750,6 +912,10 @@ inline void Table::finish_fill(std::uint32_t slot) noexcept {
         s.scratch_slot = NONE;
     }
     --in_flight_;
+    if (s.fill_binding != nullptr) {
+        --s.fill_binding->in_flight;
+        s.fill_binding = nullptr;
+    }
     if (result == Status::ok) {
         s.state = SlotState::ready;
         if (converting) {
@@ -762,9 +928,7 @@ inline void Table::finish_fill(std::uint32_t slot) noexcept {
         }
         s.state = SlotState::failed;
         s.failure = result;
-        if (s.pins == 0) {
-            make_free(slot);
-        }
+        unindex_locked(slot); // R14: erase immediately so a fresh request for this row retries
     }
     s.finishing = false;
     progress_.notify_all();
@@ -773,9 +937,10 @@ inline void Table::finish_fill(std::uint32_t slot) noexcept {
 inline void Table::unpin_locked(std::uint32_t slot) noexcept {
     Slot& s = slots_[slot];
     --pins_total_;
-    if (--s.pins == 0 && s.state == SlotState::failed) {
-        make_free(slot);
-    }
+    // Nothing to reclaim here even at pins==0: a Failed slot is already unindexed (unindex_locked ran the
+    // moment it failed) and claim_victim now reclaims failed&&pins==0 slots on its own -- no need to race
+    // ahead of it here too.
+    --s.pins;
 }
 
 inline void Table::release_lease(std::uint32_t slot, std::uint32_t epoch) noexcept {
@@ -816,6 +981,35 @@ inline void Table::release_scratch(std::uint32_t index) noexcept {
     scratch_used_[index] = false;
 }
 
+// --- completion worker ------------------------------------------------------------------------------------
+
+inline std::uint32_t Table::find_unclaimed_filling_locked() const noexcept {
+    for (std::uint32_t i = 0; i < slots_.size(); ++i) {
+        if (slots_[i].state == SlotState::filling && !slots_[i].finishing) {
+            return i;
+        }
+    }
+    return NONE;
+}
+
+inline void Table::worker_loop() noexcept {
+    std::unique_lock lock(lock_);
+    while (true) {
+        const std::uint32_t slot = find_unclaimed_filling_locked();
+        if (slot != NONE) {
+            slots_[slot].finishing = true;
+            lock.unlock();
+            finish_fill(slot); // no deadline: the worker always drives a fill all the way to terminal
+            lock.lock();
+            continue;
+        }
+        if (worker_stopping_) {
+            return;
+        }
+        progress_.wait(lock);
+    }
+}
+
 // --- public operations -----------------------------------------------------------------------------------
 
 inline std::expected<RowLease, Status> Table::resolve_one(std::uint64_t row_index) noexcept {
@@ -835,15 +1029,10 @@ inline std::expected<RowLease, Status> Table::resolve_one(std::uint64_t row_inde
         if (slot == NONE) {
             return std::unexpected(Status::pool_exhausted);
         }
-        // No unlock between claim_victim() and start_fill_locked(): both only touch this table's own
-        // bookkeeping plus non-blocking transport submission (a blocking scratch-pool wait can still
-        // happen inside it for a converting table, serialising the table against its own scratch pool
-        // -- acceptable for T0's bounded pool sizes; see the file comment's allocation note).
         const Status started = start_fill_locked(slot, row_index);
         became_finisher = started == Status::ok;
-        if (started != Status::ok && slots_[slot].pins == 0) {
-            make_free(slot);
-            return std::unexpected(started);
+        if (started != Status::ok) {
+            return std::unexpected(started); // start_fill_locked already left the slot Failed+unindexed
         }
     }
     Slot& s = slots_[slot];
@@ -905,23 +1094,98 @@ inline std::expected<std::size_t, Status> Table::resolve_into(std::span<const st
     for (std::size_t i = 0; i < rows.size(); ++i) {
         out[i].reset(); // release whatever the caller's storage held before this call (mirrors SlotPool)
     }
-    std::size_t filled = 0;
-    Status failure = Status::ok;
-    for (std::size_t i = 0; i < rows.size() && failure == Status::ok; ++i) {
-        auto lease = resolve_one(rows[i]);
-        if (!lease) {
-            failure = lease.error();
-            break;
+    for (const std::uint64_t row : rows) {
+        if (row >= config_.row_count) {
+            return std::unexpected(Status::out_of_range); // checked up front: nothing pinned yet
         }
-        out[filled++] = std::move(*lease);
+    }
+
+    // Phase A: admit and pin every row under one lock, submitting every miss's transport request without
+    // waiting on any of them -- this is what lets the batch's own fetches overlap (file comment). `out`
+    // doubles as this call's own bookkeeping of what it has pinned so far, mirroring SlotPool::resolve.
+    std::size_t pinned = 0;
+    Status failure = Status::ok;
+    {
+        std::unique_lock lock(lock_);
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const std::uint64_t row_index = rows[i];
+            std::uint32_t slot = index_find(row_index, current_generation_);
+            const bool found_ready = slot != NONE && slots_[slot].state == SlotState::ready;
+            const bool found_filling = slot != NONE && slots_[slot].state == SlotState::filling;
+            if (found_filling) {
+                ++counters_.coalesced;
+            }
+            if (slot == NONE) {
+                slot = claim_victim();
+                if (slot == NONE) {
+                    failure = Status::pool_exhausted;
+                    break;
+                }
+                const Status started = start_fill_locked(slot, row_index);
+                if (started != Status::ok) {
+                    failure = started; // slot already left Failed+unindexed by start_fill_locked
+                    break;
+                }
+            }
+            Slot& s = slots_[slot];
+            ++s.pins;
+            ++pins_total_;
+            s.referenced = true;
+            if (found_ready) {
+                ++counters_.hits;
+            }
+            RowLease& lease = out[i];
+            lease.table_ = this;
+            lease.slot_ = slot;
+            lease.epoch_ = s.epoch;
+            lease.bytes_ = {}; // filled in once ready, in phase B below
+            lease.row_index_ = row_index;
+            lease.generation_ = s.row_generation;
+            ++pinned;
+        }
     }
     if (failure != Status::ok) {
-        for (std::size_t i = 0; i < filled; ++i) {
+        // Unwind only this call's own pins. Any fetch already submitted for a DIFFERENT row in this same
+        // batch is left running -- the completion worker (or a later caller) still finishes it; it is
+        // never cancelled or force-failed just because this call failed on a later row (fix 1/2's point).
+        for (std::size_t i = 0; i < pinned; ++i) {
             out[i].reset();
         }
         return std::unexpected(failure);
     }
-    return filled;
+
+    // Phase B: drive or await each admitted row to a terminal state, in request order.
+    for (std::size_t i = 0; i < rows.size() && failure == Status::ok; ++i) {
+        RowLease& lease = out[i];
+        std::unique_lock lock(lock_);
+        Slot& s = slots_[lease.slot_];
+        if (s.epoch != lease.epoch_) {
+            failure = Status::pool_exhausted; // unreachable while pinned; guarded, not assumed
+            break;
+        }
+        if (s.state == SlotState::filling && !s.finishing) {
+            s.finishing = true;
+            lock.unlock();
+            finish_fill(lease.slot_);
+            lock.lock();
+        } else if (s.state == SlotState::filling) {
+            progress_.wait(lock, [&] { return s.epoch != lease.epoch_ || s.state != SlotState::filling; });
+        }
+        if (s.epoch != lease.epoch_) {
+            failure = Status::pool_exhausted;
+        } else if (s.state == SlotState::ready) {
+            lease.bytes_ = output_span(lease.slot_);
+        } else {
+            failure = s.failure;
+        }
+    }
+    if (failure != Status::ok) {
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            out[i].reset();
+        }
+        return std::unexpected(failure);
+    }
+    return rows.size();
 }
 
 inline std::optional<RowLease> Table::try_get(std::uint64_t row_index) noexcept {
@@ -982,7 +1246,7 @@ inline std::expected<PrefetchTicket, Status> Table::prefetch(std::span<const std
                 waiters_[std::size_t{record_index} * config_.max_batch_rows + i] = {NONE, 0};
                 continue; // exhaustion recorded implicitly: wait() finds no slot and reports "evicted"
             }
-            (void)start_fill_locked(slot, row_index); // failure recorded on the slot itself
+            (void)start_fill_locked(slot, row_index); // failure recorded on the slot itself, unindexed
         } else if (slots_[slot].state == SlotState::ready) {
             ++counters_.hits;
         } else {
@@ -995,6 +1259,8 @@ inline std::expected<PrefetchTicket, Status> Table::prefetch(std::span<const std
     ticket.record_ = record_index;
     ticket.generation_ = record.generation;
     return ticket;
+    // Deliberately NOT waited-on or finished here (prefetch never blocks, R2): any row left Filling is
+    // picked up by the completion worker even if this ticket is dropped without ever calling wait().
 }
 
 inline WaitOutcome Table::wait(const PrefetchTicket& ticket, Deadline deadline) noexcept {
@@ -1017,10 +1283,12 @@ inline WaitOutcome Table::wait(const PrefetchTicket& ticket, Deadline deadline) 
             continue;
         }
         if (s.state == SlotState::filling && !s.finishing) {
-            // Become this row's finisher: drive its fetch/codec to completion ourselves.
+            // Become this row's finisher: drive its fetch/codec to completion ourselves, honouring the
+            // caller's own deadline (fix 5) -- a timeout here leaves the row Filling for a later caller
+            // or the completion worker, never fakes a terminal result.
             s.finishing = true;
             lock.unlock();
-            finish_fill(entry.slot);
+            finish_fill(entry.slot, deadline);
             lock.lock();
         } else if (s.state == SlotState::filling) {
             // Someone else is already the finisher; just wait for them to publish a terminal state.
@@ -1041,6 +1309,10 @@ inline WaitOutcome Table::wait(const PrefetchTicket& ticket, Deadline deadline) 
             ++outcome.evicted;
         } else if (s.state == SlotState::ready) {
             ++outcome.filled;
+        } else if (s.state == SlotState::filling) {
+            // Our own finish_fill attempt above hit `deadline` and relinquished finishing; still pending.
+            ++outcome.pending;
+            outcome.status = Status::timeout;
         } else {
             ++outcome.failed;
             if (outcome.status == Status::ok) {
@@ -1051,9 +1323,29 @@ inline WaitOutcome Table::wait(const PrefetchTicket& ticket, Deadline deadline) 
     return outcome;
 }
 
-inline void Table::invalidate(std::uint64_t new_generation) noexcept {
+inline Status Table::invalidate(std::uint64_t new_generation, sub0mempage::SourceId new_source,
+                                std::uint64_t new_source_bytes, RowExtentResolverRef new_resolver) noexcept {
+    if (new_source_bytes == 0) {
+        return Status::invalid_argument;
+    }
     const std::scoped_lock lock(lock_);
+    if (retiring_binding_ != nullptr && retiring_binding_->in_flight != 0) {
+        // R4: reject a transition this table cannot yet safely make, rather than lose track of a live
+        // transfer on the binding that would otherwise be discarded here.
+        return Status::busy;
+    }
+    retiring_binding_.reset(); // safe: either never set, or already fully drained (checked above)
+
+    const RowExtentResolverRef resolver = new_resolver.valid() ? new_resolver : current_binding_->resolver;
+    Status error = Status::ok;
+    std::unique_ptr<Binding> new_binding = make_binding(new_source, new_source_bytes, resolver, error);
+    if (new_binding == nullptr) {
+        return error;
+    }
+    retiring_binding_ = std::move(current_binding_); // pointee's address is unchanged -- see Binding's comment
+    current_binding_ = std::move(new_binding);
     current_generation_ = new_generation;
+    return Status::ok;
 }
 
 inline TableStats Table::stats() const noexcept {

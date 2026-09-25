@@ -16,11 +16,15 @@
  *    resolve_into              -> Table::resolve_into(rows, out) -- all-or-nothing, blocking (R2, R3)
  *    try_get                   -> Table::try_get(row_index) -> optional<RowLease>, never blocks (R11)
  *    stats                     -> Table::stats() -> TableStats (R10)
- *    invalidate                -> Table::invalidate(new_generation) (R4)
+ *    invalidate                -> Table::invalidate(new_generation, new_source, new_source_bytes,
+ *                                 new_resolver = {}) -> Status (R4; carries a new immutable source
+ *                                 snapshot, not just a number -- see row_cache.hpp's file comment)
  *
  *  Real local-file transport (T1), GPU representations (T2) and a remote mirror (T3) are not
  *  implemented here; T0's transport is whatever sub0mempage::FillBackendRef the registering caller
- *  supplies (a deterministic fake in this project's own tests -- tests/fake_backend.hpp).
+ *  supplies (a deterministic fake in this project's own tests -- tests/fake_backend.hpp). Each Table
+ *  runs one internal completion-worker thread (started in create(), joined in the destructor) so a
+ *  dropped prefetch ticket's fill still reaches a terminal state without anyone calling wait().
  */
 
 #include "sub0tieredcache/codec.hpp"

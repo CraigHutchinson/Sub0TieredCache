@@ -132,7 +132,22 @@ around forever.
   *second*, smaller bounded pool alongside a `TransferSet` (for exactly this "raw stage then transform"
   shape) would let T1 do this without T0 inventing its own parallel pool and mutex.
 - **No cross-instance guard yet that one allocation is not registered with both a `SlotPool` and a
-  `TransferSet` (R18)**, already flagged as deferred in Sub0MemPage's own `slot_pool.hpp`. T0 does not
-  hit this (its output and scratch storage are two disjoint spans, each owned by exactly one
-  `TransferSet`), but T1's real-file adapter is more likely to, so re-raising it here rather than letting
-  it resurface as a fresh discovery at T1 time.
+  `TransferSet` (R18)**, already flagged as deferred in Sub0MemPage's own `slot_pool.hpp`. T0 itself now
+  deliberately relies on the *TransferSet<->TransferSet* variant of the same gap: `invalidate()` (R4)
+  builds a brand-new `TransferSet` per binding over the SAME `output_storage`/`scratch_storage` spans as
+  the binding it supersedes, so the current and a still-draining "retiring" binding are two live
+  `TransferSet` objects registered over overlapping destination memory at once. This is safe only because
+  `Table` itself is the sole allocator of which slot (and thus which destination byte range) is live at
+  any moment -- a byte range is never resubmitted-into while any earlier claim against it (old or new
+  binding) is still outstanding, since a Filling slot is never picked as an eviction victim regardless of
+  which binding started its fetch. Sub0MemPage has no way to check this invariant itself today; a future
+  cross-instance registration guard (R18) would need to accept "two TransferSets, one destination span,
+  never truly concurrent at the byte-range level" as a legitimate pattern, not just reject it outright.
+- **Ubuntu's `clang` + system `libstdc++` cannot compile `<expected>` at all.** Confirmed against
+  Sub0MemPage's own headers, not something specific to this project's code: Clang 18 reports
+  `__cpp_concepts` as the C++20 TS value `201907L` rather than `202002L`, and libstdc++ 13's `<expected>`
+  gates itself off entirely below `202002L`. Not a defect to fix in either library (it is a real
+  clang/libstdc++ version-interop gap); both projects' CI now builds their `clang` job against `libc++`
+  instead (`-stdlib=libc++`, `libc++-18-dev`/`libc++abi-18-dev` installed first) rather than silently
+  running a `clang` job that only compiles the parts of the codebase that happen not to touch
+  `std::expected`.

@@ -200,7 +200,8 @@ void test_generations() {
     check(f.table->resolve_into(std::array{std::uint64_t{0}}, gen1).has_value(), "row 0 resolves under generation 1");
     check(gen1[0].generation() == 1, "the lease captures generation 1");
 
-    f.table->invalidate(2);
+    check(f.table->invalidate(2, SourceId{1}, f.row_count * f.row_bytes) == Status::ok,
+          "invalidate succeeds with a same-shaped new source binding");
     std::vector<RowLease> gen2(1);
     check(f.table->resolve_into(std::array{std::uint64_t{0}}, gen2).has_value(),
           "row 0 resolves again under generation 2 while the generation-1 lease is still held");
@@ -216,7 +217,7 @@ void test_generation_budget_conflict_is_rejected() {
     std::vector<RowLease> gen1(1);
     check(f.table->resolve_into(std::array{std::uint64_t{0}}, gen1).has_value(), "row 0 resolves under generation 1");
 
-    f.table->invalidate(2);
+    check(f.table->invalidate(2, SourceId{1}, f.row_count * f.row_bytes) == Status::ok, "invalidate succeeds");
     std::vector<RowLease> gen2(1);
     auto result = f.table->resolve_into(std::array{std::uint64_t{0}}, gen2);
     check(!result.has_value() && result.error() == Status::pool_exhausted,

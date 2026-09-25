@@ -14,7 +14,20 @@ no remote mirror (T3), no accelerated backend (T4), and no `RowCache`-level conv
 `docs/integration-plan.md`'s T0 acceptance row asks for. `try_get`, `resolve_into`/`wait`, `prefetch`,
 `invalidate` and `stats` are all implemented per REQUIREMENTS.md R1–R14 for the host-only, in-memory
 case; see docs/integration-plan.md's "Contract feedback to Sub0MemPage (T0)" section for the gaps found
-along the way. This document is the pitch and the historical concrete API surface;
+along the way.
+
+Two implementation details worth knowing before using `Table` directly: (1) `invalidate` takes a new
+immutable source snapshot (`SourceId`, extent, and optionally a new row→extent resolver), not just a new
+generation number — invalidation re-reads from somewhere new, it does not just relabel the existing
+bytes (REQUIREMENTS.md R4). At most one superseded ("retiring") binding may still have fills in flight at
+a time; invalidating again before that drains reports `Status::busy`. (2) Every `Table` runs one internal
+completion-worker thread (started in `create()`, stopped and joined in the destructor) so a fill nobody
+ever calls `wait()`/`resolve_into` on again — a dropped prefetch ticket, or a fetch left running after a
+`resolve_into` batch failed admission on a later row — still reaches a terminal state and its slot stays
+evictable, instead of leaking Filling forever. `resolve_into` and `wait` still become a fill's finisher
+inline when nobody else has, for latency; the worker only picks up what nothing else claims.
+
+This document is the pitch and the historical concrete API surface;
 [REQUIREMENTS.md](REQUIREMENTS.md) is the normative contract T0 is checked against, and
 [docs/integration-plan.md](docs/integration-plan.md) is what actually governs delivery order now.
 
