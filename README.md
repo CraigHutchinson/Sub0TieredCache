@@ -2,9 +2,44 @@
 
 The [integration plan](docs/integration-plan.md) owns the current delivery sequence and the MemPage boundary. Historical design discussion below supplies motivation, not additional shipped capabilities.
 
-Status: **SPEC / REQUIREMENTS DRAFT.** No implementation exists yet, in either Sub0Llm or this repo —
-`include/sub0tieredcache/sub0tieredcache.hpp` is a skeleton. This document is the pitch and the concrete API surface;
-[REQUIREMENTS.md](REQUIREMENTS.md) is the normative contract an implementation is checked against.
+Status: **T0 implemented** (docs/integration-plan.md's delivery table) — a bounded in-memory row cache
+(`sub0tieredcache::RowCache`/`Table`/`RowLease`/`PrefetchTicket`, `include/sub0tieredcache/row_cache.hpp`)
+over Sub0MemPage's M2 explicit-destination transport, with a built-in identity representation and a
+bit-exact bf16→f32 widening codec (`include/sub0tieredcache/codec.hpp`), plus a caller-registerable
+`Codec` for anything else. T0's own transport is whatever `sub0mempage::FillBackendRef` the registering
+caller supplies — this project's own tests exercise it against a deterministic fake backend
+(`tests/fake_backend.hpp`), not a real file. **T1 (real local-file transport, using Sub0MemPage's real
+lower scheduler) is not implemented yet** — do not read T0 as end-to-end file-backed caching. No GPU (T2),
+no remote mirror (T3), no accelerated backend (T4), and no `RowCache`-level convenience beyond what
+`docs/integration-plan.md`'s T0 acceptance row asks for. `try_get`, `resolve_into`/`wait`, `prefetch`,
+`invalidate` and `stats` are all implemented per REQUIREMENTS.md R1–R14 for the host-only, in-memory
+case; see docs/integration-plan.md's "Contract feedback to Sub0MemPage (T0)" section for the gaps found
+along the way.
+
+Two implementation details worth knowing before using `Table` directly: (1) `invalidate` takes a new
+immutable source snapshot (`SourceId`, extent, and optionally a new row→extent resolver), not just a new
+generation number — invalidation re-reads from somewhere new, it does not just relabel the existing
+bytes (REQUIREMENTS.md R4). At most one superseded ("retiring") binding may still have fills in flight at
+a time; invalidating again before that drains reports `Status::busy`. (2) Every `Table` runs one internal
+completion-worker thread (started in `create()`, stopped and joined in the destructor) so a fill nobody
+ever calls `wait()`/`resolve_into` on again — a dropped prefetch ticket, or a fetch left running after a
+`resolve_into` batch failed admission on a later row — still reaches a terminal state and its slot stays
+evictable, instead of leaking Filling forever. `resolve_into` and `wait` still become a fill's finisher
+inline when nobody else has, for latency; the worker only picks up what nothing else claims.
+
+This document is the pitch and the historical concrete API surface;
+[REQUIREMENTS.md](REQUIREMENTS.md) is the normative contract T0 is checked against, and
+[docs/integration-plan.md](docs/integration-plan.md) is what actually governs delivery order now.
+
+**Dependency**: Sub0TieredCache → [Sub0MemPage](https://github.com/CraigHutchinson/Sub0MemPage), pinned via
+CMake `FetchContent` to commit
+[`2340409b43db2cb03efe6d586a50f4ced5114b73`](https://github.com/CraigHutchinson/Sub0MemPage/commit/2340409b43db2cb03efe6d586a50f4ced5114b73)
+(`CMakeLists.txt`'s `SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION`) — `find_package`-free, matching this project's
+own no-third-party-dependency spirit for a sibling `Sub0` project. Sub0MemPage's own tests/benchmarks/tools
+are never built as part of this project's build. For offline or sibling-checkout development, point
+`FETCHCONTENT_SOURCE_DIR_SUB0MEMPAGE` at a local Sub0MemPage checkout (optionally with
+`FETCHCONTENT_FULLY_DISCONNECTED=ON` to guarantee no network access is attempted) — see
+`CMakeLists.txt`'s comment for the exact invocation.
 
 **Documentation map**:
 - [REQUIREMENTS.md](REQUIREMENTS.md) — the normative contract (R1–R14), each a testable sentence.

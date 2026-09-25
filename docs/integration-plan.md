@@ -100,3 +100,47 @@ native-Linux qualification, not a requirement imposed on macOS or Windows users.
 Each gate reports lower/upper repository revisions, fixture hashes, test/skip counts, seed, compiler and
 backend facts. No shared live file is mutated by two test processes. End-to-end traces feed row size,
 working-set/reuse distance and concurrency needs back into T0/T1 fixtures, without importing model code.
+
+## Contract feedback to Sub0MemPage (T0)
+
+Found while implementing T0 against the pinned Sub0MemPage revision (README.md records the exact commit).
+None of these blocked T0 -- each was worked around locally, as noted -- but they are real gaps in the M2
+contract as shipped, not just style preferences, so they are recorded here rather than silently patched
+around forever.
+
+- ~~No installed/exported test-support target for the deterministic fake backend.~~ **RESOLVED** (T1,
+  Sub0MemPage commit `69227db3cf7c37a6908e46cfbd71dda14c926c20`): Sub0MemPage now exports
+  `Sub0MemPage::testing`, an INTERFACE target carrying `<sub0mempage/testing/fake_backend.hpp>`. T0's
+  hand-maintained copy in `tests/fake_backend.hpp` has been deleted; every test now links
+  `Sub0MemPage::testing` and includes the real header directly.
+- **A blocking scratch-pool acquisition inside `TransferSet::submit`'s critical section would deadlock
+  a caller's own single global lock.** Not a Sub0MemPage bug -- `TransferSet` itself has no such
+  blocking call -- but T0's own conversion path needed a bounded raw-byte staging pool *around*
+  `TransferSet`, and the natural first design (a blocking acquire, mirroring how `SlotPool::resolve`
+  itself blocks) deadlocks against T0's own single-mutex admission path: a finisher thread can only free
+  a scratch slot by re-acquiring the same lock the blocked acquirer is holding. T0's own scratch pool is
+  therefore non-blocking (`Table::acquire_scratch` returns `pool_exhausted` immediately rather than
+  waiting) -- see `include/sub0tieredcache/row_cache.hpp`'s `acquire_scratch`/`start_fill_locked`
+  comments. This is recorded here because a future Sub0MemPage feature that lets a caller register a
+  *second*, smaller bounded pool alongside a `TransferSet` (for exactly this "raw stage then transform"
+  shape) would let T1 do this without T0 inventing its own parallel pool and mutex.
+- **No cross-instance guard yet that one allocation is not registered with both a `SlotPool` and a
+  `TransferSet` (R18)**, already flagged as deferred in Sub0MemPage's own `slot_pool.hpp`. T0 itself now
+  deliberately relies on the *TransferSet<->TransferSet* variant of the same gap: `invalidate()` (R4)
+  builds a brand-new `TransferSet` per binding over the SAME `output_storage`/`scratch_storage` spans as
+  the binding it supersedes, so the current and a still-draining "retiring" binding are two live
+  `TransferSet` objects registered over overlapping destination memory at once. This is safe only because
+  `Table` itself is the sole allocator of which slot (and thus which destination byte range) is live at
+  any moment -- a byte range is never resubmitted-into while any earlier claim against it (old or new
+  binding) is still outstanding, since a Filling slot is never picked as an eviction victim regardless of
+  which binding started its fetch. Sub0MemPage has no way to check this invariant itself today; a future
+  cross-instance registration guard (R18) would need to accept "two TransferSets, one destination span,
+  never truly concurrent at the byte-range level" as a legitimate pattern, not just reject it outright.
+- **Ubuntu's `clang` + system `libstdc++` cannot compile `<expected>` at all.** Confirmed against
+  Sub0MemPage's own headers, not something specific to this project's code: Clang 18 reports
+  `__cpp_concepts` as the C++20 TS value `201907L` rather than `202002L`, and libstdc++ 13's `<expected>`
+  gates itself off entirely below `202002L`. Not a defect to fix in either library (it is a real
+  clang/libstdc++ version-interop gap); both projects' CI now builds their `clang` job against `libc++`
+  instead (`-stdlib=libc++`, `libc++-18-dev`/`libc++abi-18-dev` installed first) rather than silently
+  running a `clang` job that only compiles the parts of the codebase that happen not to touch
+  `std::expected`.

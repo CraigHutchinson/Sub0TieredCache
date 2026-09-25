@@ -23,6 +23,10 @@ endif()
 # substantial enough that header-only stops being the right packaging (README.md sec 5.2).
 add_library(Sub0TieredCache INTERFACE)
 add_library(Sub0TieredCache::Sub0TieredCache ALIAS Sub0TieredCache)
+if(WIN32)
+    # remote/http_client.hpp (the optional built-in plain-HTTP range client) uses Winsock.
+    target_link_libraries(Sub0TieredCache INTERFACE ws2_32)
+endif()
 
 target_include_directories(Sub0TieredCache INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -32,6 +36,41 @@ target_include_directories(Sub0TieredCache INTERFACE
 # constraint here, a deliberate choice for this project too (see STYLE_GUIDE.md).
 target_compile_features(Sub0TieredCache INTERFACE cxx_std_23)
 
-if(SUB0TIEREDCACHE_BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
+# Dependency: Sub0TieredCache -> Sub0MemPage only (lead decision 1; find_package-free, matches
+# STYLE_GUIDE.md's "no third-party dependencies" spirit -- Sub0MemPage is a sibling Sub0 project, not a
+# third party, but the same "no surprise system search" preference applies). Pinned to the exact commit
+# docs/integration-plan.md's acceptance-order gate reports (README.md records the pinned revision).
+#
+# Offline/sibling-checkout development: set FETCHCONTENT_SOURCE_DIR_SUB0MEMPAGE to a local Sub0MemPage
+# checkout to skip the network fetch entirely (CMake's own FetchContent convention: the variable name is
+# the fetched dependency's name, upper-cased, exactly as SUB0MEMPAGE here). Combine with
+# -DFETCHCONTENT_FULLY_DISCONNECTED=ON once that variable is set to guarantee no network access is even
+# attempted (the Sub0Llm stack plan requires ordinary builds/tests to stay offline). Example:
+#   cmake --preset default \
+#     -DFETCHCONTENT_SOURCE_DIR_SUB0MEMPAGE=/path/to/Sub0MemPage \
+#     -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+# Bumped for T1: Sub0MemPage's M3 slice 1 (local_file_backend.hpp) and its exported
+# Sub0MemPage::testing target (testing/include/sub0mempage/testing/fake_backend.hpp).
+set(SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION "69227db3cf7c37a6908e46cfbd71dda14c926c20"
+    CACHE STRING "Pinned Sub0MemPage commit (docs/integration-plan.md acceptance order).")
+
+if(NOT IS_SUBPROJECT)
+    include(FetchContent)
+    # Sub0MemPage's own tests/bench/tools must not build as part of Sub0TieredCache's build -- set its
+    # options OFF before MakeAvailable (its CMakeLists.txt option names: SUB0MEMPAGE_BUILD_TESTING,
+    # SUB0MEMPAGE_BUILD_EXAMPLES; see docs/integration-plan.md's "Contract feedback" section for why
+    # there is no single "don't build tools" switch to flip instead).
+    set(SUB0MEMPAGE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(SUB0MEMPAGE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        Sub0MemPage
+        GIT_REPOSITORY https://github.com/CraigHutchinson/Sub0MemPage.git
+        GIT_TAG ${SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION}
+    )
+    FetchContent_MakeAvailable(Sub0MemPage)
+    target_link_libraries(Sub0TieredCache INTERFACE Sub0MemPage::Sub0MemPage)
+endif()
+
+if(SUB0TIEREDCACHE_BUILD_TESTING AND NOT IS_SUBPROJECT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
 endif()
