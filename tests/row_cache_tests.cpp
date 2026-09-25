@@ -31,11 +31,11 @@ struct FixedWidthResolver {
     std::uint64_t row_bytes = 0;
     std::uint64_t row_count = 0;
 
-    [[nodiscard]] std::expected<ByteRange, Status> resolve_extent(std::uint64_t row) const noexcept {
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t row) const noexcept {
         if (row >= row_count) {
             return std::unexpected(Status::out_of_range);
         }
-        return ByteRange{row * row_bytes, row_bytes};
+        return RowLocation{0, ByteRange{row * row_bytes, row_bytes}};
     }
 };
 
@@ -65,8 +65,9 @@ struct IdentityFixture {
         cfg.source_row_bytes = row_bytes;
         cfg.output_row_bytes = row_bytes;
         cfg.representation = Representation::identity;
-        cfg.source = SourceId{1};
-        cfg.source_bytes = row_count * row_bytes;
+        const auto cfg_sources = single_source(SourceId{1}, row_count * row_bytes);
+        cfg.sources = cfg_sources;
+
         cfg.generation = 1;
         cfg.resolve_extent = RowExtentResolverRef(resolver);
         cfg.output_storage = output_storage;
@@ -100,8 +101,9 @@ void test_registration_validation() {
     cfg.source_row_bytes = 8;
     cfg.output_row_bytes = 8;
     cfg.representation = Representation::identity;
-    cfg.source = SourceId{1};
-    cfg.source_bytes = 16;
+    const auto cfg_sources = single_source(SourceId{1}, 16);
+    cfg.sources = cfg_sources;
+
     FixedWidthResolver resolver{8, 2};
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -143,6 +145,40 @@ void test_bounds() {
     check(!out[0].is_held(), "no lease held after an out-of-range request");
 
     check(!f.table->try_get(f.row_count).has_value(), "try_get on an out-of-range row misses cleanly");
+}
+
+/// A resolver that names a shard index this table never registered (T1: sharded sources). Must fail
+/// cleanly, not index off the end of the binding's per-shard TransferSet/ShardSource vectors.
+struct OutOfRangeShardResolver {
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t) const noexcept {
+        return RowLocation{5, ByteRange{0, 8}}; // this table registers exactly one shard (index 0)
+    }
+};
+
+void test_resolver_naming_an_unregistered_shard_fails_cleanly() {
+    Backend backend(4);
+    OutOfRangeShardResolver resolver;
+    std::vector<std::byte> output(8);
+    TableConfig cfg{};
+    cfg.row_count = 1;
+    cfg.source_row_bytes = 8;
+    cfg.output_row_bytes = 8;
+    cfg.representation = Representation::identity;
+    const auto cfg_sources = single_source(SourceId{1}, 8);
+    cfg.sources = cfg_sources;
+    cfg.generation = 1;
+    cfg.resolve_extent = RowExtentResolverRef(resolver);
+    cfg.output_storage = output;
+    cfg.budget_rows = 1;
+    cfg.max_tickets = 1;
+    cfg.max_batch_rows = 1;
+    auto table = std::move(*Table::create(cfg, FillBackendRef(backend)));
+
+    std::array<RowLease, 1> out{};
+    auto result = table->resolve_into(std::array<std::uint64_t, 1>{0}, out);
+    check(!result.has_value() && result.error() == Status::out_of_range,
+          "a resolver naming an unregistered shard fails explicitly with out_of_range, never indexes off the end");
+    (void)table->drain();
 }
 
 void test_duplicate_and_order() {
@@ -200,7 +236,7 @@ void test_generations() {
     check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen1).has_value(), "row 0 resolves under generation 1");
     check(gen1[0].generation() == 1, "the lease captures generation 1");
 
-    check(f.table->invalidate(2, SourceId{1}, f.row_count * f.row_bytes) == Status::ok,
+    check(f.table->invalidate(2, single_source(SourceId{1}, f.row_count * f.row_bytes)) == Status::ok,
           "invalidate succeeds with a same-shaped new source binding");
     std::vector<RowLease> gen2(1);
     check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen2).has_value(),
@@ -217,7 +253,7 @@ void test_generation_budget_conflict_is_rejected() {
     std::vector<RowLease> gen1(1);
     check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen1).has_value(), "row 0 resolves under generation 1");
 
-    check(f.table->invalidate(2, SourceId{1}, f.row_count * f.row_bytes) == Status::ok, "invalidate succeeds");
+    check(f.table->invalidate(2, single_source(SourceId{1}, f.row_count * f.row_bytes)) == Status::ok, "invalidate succeeds");
     std::vector<RowLease> gen2(1);
     auto result = f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen2);
     check(!result.has_value() && result.error() == Status::pool_exhausted,
@@ -240,8 +276,9 @@ void test_codec_failure_publishes_nothing() {
     cfg.output_row_bytes = row_bytes; // widths are irrelevant to a custom codec's own contract
     cfg.representation = Representation::custom;
     cfg.codec = &codec;
-    cfg.source = SourceId{2};
-    cfg.source_bytes = row_count * row_bytes;
+    const auto cfg_sources = single_source(SourceId{2}, row_count * row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -296,8 +333,9 @@ void test_bf16_to_f32_bit_exact() {
     cfg.source_row_bytes = source_row_bytes;
     cfg.output_row_bytes = output_row_bytes;
     cfg.representation = Representation::bf16_to_f32;
-    cfg.source = SourceId{3};
-    cfg.source_bytes = source_row_bytes;
+    const auto cfg_sources = single_source(SourceId{3}, source_row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -380,6 +418,7 @@ void test_stats_snapshot() {
 int main() {
     run(test_registration_validation, "registration_validation");
     run(test_bounds, "bounds");
+    run(test_resolver_naming_an_unregistered_shard_fails_cleanly, "resolver_naming_an_unregistered_shard_fails_cleanly");
     run(test_duplicate_and_order, "duplicate_and_order");
     run(test_budget_exhaustion_is_all_or_nothing, "budget_exhaustion_is_all_or_nothing");
     run(test_row_lease_lifetime_blocks_eviction, "row_lease_lifetime_blocks_eviction");

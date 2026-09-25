@@ -2,19 +2,40 @@
 
 The [integration plan](docs/integration-plan.md) owns the current delivery sequence and the MemPage boundary. Historical design discussion below supplies motivation, not additional shipped capabilities.
 
-Status: **T0 implemented** (docs/integration-plan.md's delivery table) — a bounded in-memory row cache
-(`sub0tieredcache::RowCache`/`Table`/`RowLease`/`PrefetchTicket`, `include/sub0tieredcache/row_cache.hpp`)
-over Sub0MemPage's M2 explicit-destination transport, with a built-in identity representation and a
-bit-exact bf16→f32 widening codec (`include/sub0tieredcache/codec.hpp`), plus a caller-registerable
-`Codec` for anything else. T0's own transport is whatever `sub0mempage::FillBackendRef` the registering
-caller supplies — this project's own tests exercise it against a deterministic fake backend
-(`tests/fake_backend.hpp`), not a real file. **T1 (real local-file transport, using Sub0MemPage's real
-lower scheduler) is not implemented yet** — do not read T0 as end-to-end file-backed caching. No GPU (T2),
-no remote mirror (T3), no accelerated backend (T4), and no `RowCache`-level convenience beyond what
-`docs/integration-plan.md`'s T0 acceptance row asks for. `try_get`, `resolve_into`/`wait`, `prefetch`,
-`invalidate` and `stats` are all implemented per REQUIREMENTS.md R1–R14 for the host-only, in-memory
-case; see docs/integration-plan.md's "Contract feedback to Sub0MemPage (T0)" section for the gaps found
-along the way.
+Status: **T0, T1 and standalone T3 implemented** (docs/integration-plan.md's delivery table) — a bounded
+row cache (`sub0tieredcache::RowCache`/`Table`/`RowLease`/`PrefetchTicket`,
+`include/sub0tieredcache/row_cache.hpp`) over Sub0MemPage's M2 explicit-destination transport, sharded
+over one or more immutable sources per binding (README §3's `local_sharded`), with a built-in identity
+representation and a bit-exact bf16→f32 widening codec (`include/sub0tieredcache/codec.hpp`), plus a
+caller-registerable `Codec` for anything else. The transport is whatever `sub0mempage::FillBackendRef`
+the registering caller supplies:
+
+- **T0**: a deterministic fake backend (`Sub0MemPage::testing`'s `fake_backend.hpp`) — this project's
+  own state-machine/coalescing/generation tests, no real bytes anywhere.
+- **T1**: real local files via `sub0mempage::LocalFileBackend`, with
+  `include/sub0tieredcache/local_file_source.hpp`'s `FlatFileResolver`/`register_local_file_shard`
+  convenience for the common flat row-major layout. `tests/local_file_tests.cpp` exercises this against
+  real temp files: eviction under a tiny budget, unaligned/boundary-straddling rows, two interleaved
+  shards, an explicitly-short shard failing without publishing and a clean retry, R5 coalescing over 24
+  threads, and zero-allocation hits — every result checked against a direct `std::ifstream` slice, never
+  this project's own code.
+- **T3 (standalone remote mirror)**: `include/sub0tieredcache/remote/` is a versioned local chunk mirror
+  over a built-in plain-HTTP(S) range client (see `docs/remote-mirror.md`), plus
+  `remote/mirror_backend.hpp`, a `FillBackendRef` adapter over one or more `remote::Mirror` instances
+  (structurally a twin of `LocalFileBackend`). `tests/remote_e2e_tests.cpp` runs a `Table` against a
+  local HTTP range test server through `Mirror`+`MirrorBackend`: the first resolve genuinely goes over
+  the network, a restart over the same cache directory serves from disk with zero further network
+  requests, and a server validator (ETag) change surfaces as an explicit failed row, never stale bytes.
+
+**Not yet implemented**: GPU representations (T2), an accelerated backend (T4), and any `RowCache`-level
+convenience beyond what `docs/integration-plan.md`'s acceptance rows ask for. T1's real external shard
+fixture (a genuine multi-shard third-party format, vs. this repo's own synthetic flat/interleaved test
+files) and T3's HTTPS (the built-in client is plain HTTP; TLS is left to a caller-supplied transport, per
+`docs/remote-mirror.md`) are both explicitly out of scope so far. `try_get`, `resolve_into`/`wait`,
+`prefetch`, `invalidate` and `stats` are all implemented per REQUIREMENTS.md R1–R14 for the sharded,
+host-only case; see docs/integration-plan.md's "Contract feedback to Sub0MemPage (T0)" section for the
+gaps found along the way (as of T1, resolved: the exported `Sub0MemPage::testing` fake-backend target).
+macOS is unverified in this environment (Linux + Wine/MinGW only) — see docs/integration-plan.md.
 
 Two implementation details worth knowing before using `Table` directly: (1) `invalidate` takes a new
 immutable source snapshot (`SourceId`, extent, and optionally a new row→extent resolver), not just a new

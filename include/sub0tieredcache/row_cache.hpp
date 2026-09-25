@@ -1,16 +1,17 @@
 #pragma once
 
 /** @file row_cache.hpp
- *  @brief T0: a bounded in-memory row cache over Sub0MemPage's M2 explicit-destination transport.
+ *  @brief A bounded in-memory row cache over Sub0MemPage's M2 explicit-destination transport, sharded
+ *         (README.md sec 3's `local_sharded`) over one or more immutable sources per binding.
  *
- *  STATUS: T0 (docs/integration-plan.md's delivery table). Implements the acceptance row for T0:
- *  duplicate/order/bounds, budgets, RowLease lifetime, generations, codec failure -- host domain only,
- *  no GPU, no network, no disk tier, no compute engine. Real local-file transport is T1
- *  (docs/integration-plan.md); T0's transport is whatever `sub0mempage::FillBackendRef` the caller
- *  supplies, exercised in this project's own tests with a deterministic fake backend copied from
- *  Sub0MemPage's own tests/fake_backend.hpp (never installed by Sub0MemPage -- see
- *  docs/integration-plan.md's "Contract feedback to Sub0MemPage (T0)" section for why this is a
- *  test-support gap, not a design choice).
+ *  STATUS: T0+T1 (docs/integration-plan.md's delivery table). Implements the T0 acceptance row
+ *  (duplicate/order/bounds, budgets, RowLease lifetime, generations, codec failure) plus T1's sharded
+ *  sources and real local-file transport -- host domain only, no GPU, no network transport of its own
+ *  (T3's remote::Mirror is adapted through the same FillBackendRef seam, not a special case here). The
+ *  transport itself is whatever `sub0mempage::FillBackendRef` the caller supplies: a deterministic fake
+ *  in this project's own T0-era tests (`Sub0MemPage::testing`'s fake_backend.hpp), and
+ *  `sub0mempage::LocalFileBackend` for real files (see local_file_source.hpp) or
+ *  `remote::MirrorBackend` for a remote source (see remote/mirror_backend.hpp) for T1/T3.
  *
  *  Architecture, one Table at a time (RowCache below is just a named collection of these):
  *
@@ -53,24 +54,33 @@
  *    then drives or awaits each admitted row to a terminal state. A phase-A admission failure unwinds
  *    only the pins this call took -- fills already submitted for other rows in the same call are left
  *    running for the completion worker (or a later caller) to finish, never force-failed or leaked.
- *  - Generations bind to an immutable *source*, not just a number (R4, docs/integration-plan.md
+ *  - Generations bind to an immutable *source set*, not just a number (R4, docs/integration-plan.md
  *    "Versioning and remote tier": "the caller provides a new immutable source snapshot"). `invalidate`
- *    therefore takes a new SourceId/extent/resolver and builds new sub0mempage::TransferSet(s) for it; a
- *    slot still Filling under the OLD binding keeps running against the old TransferSet(s) it already
- *    submitted through (a Claim is self-contained -- it doesn't care which binding is "current"), and
- *    the old binding is torn down only once nothing is still in flight on it. At most one binding is
- *    "retiring" at a time; invalidating again while it still has in-flight fills reports Status::busy
- *    rather than losing track of a live transfer (R4's "reject the transition explicitly").
+ *    therefore takes a new bounded span of ShardSource (SourceId+extent, one per shard)/resolver and
+ *    builds new sub0mempage::TransferSet(s) for it, one row_transfer (and, if converting, one
+ *    scratch_transfer) per shard; a slot still Filling under the OLD binding keeps running against the
+ *    old TransferSet it already submitted through (a Claim is self-contained -- it doesn't care which
+ *    binding is "current"), and the old binding is torn down only once nothing is still in flight on it.
+ *    At most one binding is "retiring" at a time; invalidating again while it still has in-flight fills
+ *    reports Status::busy rather than losing track of a live transfer (R4's "reject the transition
+ *    explicitly").
+ *  - Sharded sources (README.md sec 3 `local_sharded`, docs/integration-plan.md "Sharded sources"): a
+ *    row->location adapter returns a `RowLocation{shard, ByteRange}`, not just a `ByteRange` -- the same
+ *    row-to-extent contract R7 always had, just addressed within one of a bounded list of registered
+ *    shards instead of always shard 0. A flat single-file table just registers one shard
+ *    (`single_source(...)`) and a resolver that always returns shard 0 -- see local_file_source.hpp's
+ *    FlatFileResolver. Every shard's row_transfer/scratch_transfer is registered over the SAME
+ *    output_storage/scratch_storage span as every other shard (this binding's, and the retiring
+ *    binding's) -- safe only because Table alone decides which slot (and thus which destination byte
+ *    range) is live at any moment, extending the same argument invalidate()'s two-binding overlap
+ *    already relies on. See docs/integration-plan.md's "Contract feedback to Sub0MemPage (T0)" for why
+ *    this whole shape is flagged as an R18 cross-instance item rather than quietly relied upon.
  *  - Transport ownership: identity-representation tables submit straight into the cache's own output
- *    reservation via one `sub0mempage::TransferSet` per binding (the explicit-destination mode --
- *    docs/transfer-contract.md "Two uses of one transfer scheduler"). Converting tables read raw encoded
- *    bytes into a second, small, bounded TransferSet ("scratch"), run the codec into the output
- *    reservation, then release the scratch claim -- never retaining an unowned source pointer past the
- *    codec call (R6). The current and retiring bindings' TransferSets are two separate MemPage objects
- *    registered over the SAME output/scratch destination spans; this is safe only because Table itself
- *    is the sole authority over which slot (and thus which destination byte range) is live at any time --
- *    see docs/integration-plan.md's "Contract feedback to Sub0MemPage (T0)" for why this is flagged as an
- *    R18 cross-instance item rather than quietly relied upon.
+ *    reservation via one `sub0mempage::TransferSet` per shard per binding (the explicit-destination mode
+ *    -- docs/transfer-contract.md "Two uses of one transfer scheduler"). Converting tables read raw
+ *    encoded bytes into a second, small, bounded TransferSet per shard ("scratch"), run the codec into
+ *    the output reservation, then release the scratch claim -- never retaining an unowned source pointer
+ *    past the codec call (R6).
  *
  *  Allocation: everything the hot paths touch (slots_, the row index, ticket/waiter tables, the scratch
  *  free-list) is sized once in Table::create(); try_get and a resolve_into that only hits already-Ready
@@ -86,6 +96,7 @@
 #include <sub0mempage/transfer_set.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <condition_variable>
 #include <cstddef>
@@ -113,19 +124,46 @@ enum class Representation : std::uint8_t {
     custom,      ///< A caller-registered Codec; TableConfig::codec must be non-null.
 };
 
-/** @brief Type-erased, non-owning row->source-extent adapter (REQUIREMENTS.md R7).
+/// One registered shard of a (possibly sharded) source: its own MemPage SourceId plus its total
+/// addressable extent. README.md sec 3's `local_sharded` shape (docs/integration-plan.md "Sharded
+/// sources"): a table's rows may live across more than one immutable source, each with its own identity
+/// -- an external shard set (e.g. safetensors' `model-NNNNN-of-MMMMM.safetensors`), not a format this
+/// core parses (AGENTS.md sec 2), just a bounded list of (SourceId, extent) pairs the caller supplies.
+struct ShardSource {
+    sub0mempage::SourceId source{};
+    std::uint64_t bytes = 0;
+};
+
+/// Where one row's encoded bytes live: which registered shard, and the byte range within it.
+struct RowLocation {
+    std::uint32_t shard = 0;
+    sub0mempage::ByteRange range;
+};
+
+/// Convenience for the common single-source (flat-file) case (README.md sec 3: "keep a single-source
+/// convenience so the flat-file case stays trivial"). The returned array is a local the caller assigns
+/// straight into TableConfig::sources / invalidate()'s new_sources -- it only needs to outlive that one
+/// call, which a same-statement or same-scope local always does.
+[[nodiscard]] constexpr std::array<ShardSource, 1> single_source(sub0mempage::SourceId source,
+                                                                  std::uint64_t bytes) noexcept {
+    return {ShardSource{source, bytes}};
+}
+
+/** @brief Type-erased, non-owning row->location adapter (REQUIREMENTS.md R7).
  *
  *  "A caller supplies an offset-resolution callback (row_index -> (shard, byte_offset)); the core only
  *  ever calls it." Mirrors sub0mempage::FillBackendRef's shape deliberately: a function pointer plus a
- *  non-owning context, not std::function, so resolving a row's extent never allocates. The callback
+ *  non-owning context, not std::function, so resolving a row's location never allocates. The callback
  *  itself must be prevalidated/bounded pure address arithmetic (AGENTS.md sec 2) -- it is called with no
- *  table lock held, but from a thread that may go on to block on I/O, so it must not itself block.
- *  Default-constructed is "invalid" (`valid() == false`); `invalidate()` uses that to mean "keep the
- *  current resolver".
+ *  table lock held, but from a thread that may go on to block on I/O, so it must not itself block. A
+ *  single-source table's resolver always returns shard 0 (RowLocation's default) -- see
+ *  local_file_source.hpp's FlatFileResolver for the trivial flat-file case README.md sec 3 asks to keep
+ *  simple. Default-constructed is "invalid" (`valid() == false`); `invalidate()` uses that to mean "keep
+ *  the current resolver".
  */
 class RowExtentResolverRef {
 public:
-    using Fn = std::expected<sub0mempage::ByteRange, Status> (*)(void*, std::uint64_t) noexcept;
+    using Fn = std::expected<RowLocation, Status> (*)(void*, std::uint64_t) noexcept;
 
     constexpr RowExtentResolverRef() noexcept = default;
     constexpr RowExtentResolverRef(void* context, Fn fn) noexcept : context_(context), fn_(fn) {}
@@ -133,7 +171,7 @@ public:
     template <class Resolver>
         requires(!std::same_as<std::remove_cv_t<Resolver>, RowExtentResolverRef>) &&
                 requires(Resolver& resolver, std::uint64_t row) {
-                    { resolver.resolve_extent(row) } noexcept -> std::same_as<std::expected<sub0mempage::ByteRange, Status>>;
+                    { resolver.resolve_extent(row) } noexcept -> std::same_as<std::expected<RowLocation, Status>>;
                 }
     explicit RowExtentResolverRef(Resolver& resolver) noexcept
         : context_(&resolver),
@@ -142,7 +180,7 @@ public:
           }) {}
 
     [[nodiscard]] bool valid() const noexcept { return fn_ != nullptr; }
-    [[nodiscard]] std::expected<sub0mempage::ByteRange, Status> resolve(std::uint64_t row_index) const noexcept {
+    [[nodiscard]] std::expected<RowLocation, Status> resolve(std::uint64_t row_index) const noexcept {
         return fn_(context_, row_index);
     }
 
@@ -236,19 +274,20 @@ struct TableStats {
     std::uint64_t failed = 0;          ///< Terminal transport/codec failures observed.
 };
 
-/// Registration parameters for one table (an administrative call: may allocate, may block). `source`,
-/// `source_bytes`, `generation` and `resolve_extent` seed the table's *initial* binding; later bindings
-/// come from invalidate()'s own arguments, not from re-reading this struct.
+/// Registration parameters for one table (an administrative call: may allocate, may block). `sources`,
+/// `generation` and `resolve_extent` seed the table's *initial* binding; later bindings come from
+/// invalidate()'s own arguments, not from re-reading this struct. `sources` is copied into the binding
+/// at Table::create() time (administrative, may allocate), so the span itself only needs to outlive that
+/// one call -- see single_source() for the common single-shard case.
 struct TableConfig {
     std::uint64_t row_count = 0;              ///< Addressable row_index range is [0, row_count).
-    std::uint64_t source_row_bytes = 0;       ///< Encoded row width the adapter's extents must have.
+    std::uint64_t source_row_bytes = 0;       ///< Encoded row width the adapter's locations must have.
     std::uint64_t output_row_bytes = 0;       ///< Published row width (== source_row_bytes iff identity).
     Representation representation = Representation::identity;
     Codec* codec = nullptr;                   ///< Required iff representation == custom; unused otherwise.
-    sub0mempage::SourceId source{};           ///< MemPage source identity for the initial binding.
-    std::uint64_t source_bytes = 0;           ///< Total addressable extent of that initial source.
+    std::span<const ShardSource> sources;     ///< Bounded list of shards for the initial binding (>= 1).
     std::uint64_t generation = 0;             ///< Initial source generation (R4).
-    RowExtentResolverRef resolve_extent;      ///< row_index -> encoded ByteRange (R1, R7).
+    RowExtentResolverRef resolve_extent;      ///< row_index -> RowLocation (shard + ByteRange) (R1, R7).
     std::span<std::byte> output_storage;      ///< Caller-owned; size == budget_rows * output_row_bytes.
     std::uint32_t budget_rows = 0;            ///< Resident-row capacity (R12); the cache's whole budget.
     std::span<std::byte> scratch_storage;     ///< Caller-owned; size == scratch_rows*source_row_bytes.
@@ -336,11 +375,13 @@ public:
 
     /** @brief Administrative generation transition (R4, docs/integration-plan.md "Versioning and remote
      *  tier": invalidation publishes a new immutable source *snapshot*, not just a new number). New
-     *  requests bind to `new_generation` reading from `new_source`/`new_source_bytes` via `new_resolver`
-     *  (or the current resolver, if `new_resolver` is default-constructed/invalid); already-resident
-     *  rows keep their captured generation and binding until evicted, so old leases stay valid and old
-     *  in-flight fills keep reading from the old source. May allocate (it builds new
-     *  sub0mempage::TransferSet objects for the new binding) but never touches I/O itself.
+     *  requests bind to `new_generation` reading from `new_sources` (one entry per shard; a single-shard
+     *  table just passes single_source(...)) via `new_resolver` (or the current resolver, if
+     *  `new_resolver` is default-constructed/invalid); already-resident rows keep their captured
+     *  generation and binding until evicted, so old leases stay valid and old in-flight fills keep
+     *  reading from the old source set. May allocate (it builds new sub0mempage::TransferSet objects for
+     *  the new binding, one per shard) but never touches I/O itself. `new_sources` only needs to outlive
+     *  this one call (copied into the new binding).
      *
      *  At most one binding may be "retiring" (superseded but still draining in-flight fills) at a time:
      *  calling this again while the previous retiring binding still has fills in flight returns
@@ -352,8 +393,7 @@ public:
      *  exactly as an ordinary single-generation exhaustion would -- see
      *  test_generation_budget_conflict_is_rejected in tests/row_cache_tests.cpp.
      */
-    [[nodiscard]] Status invalidate(std::uint64_t new_generation, sub0mempage::SourceId new_source,
-                                     std::uint64_t new_source_bytes,
+    [[nodiscard]] Status invalidate(std::uint64_t new_generation, std::span<const ShardSource> new_sources,
                                      RowExtentResolverRef new_resolver = {}) noexcept;
 
     [[nodiscard]] TableStats stats() const noexcept;
@@ -369,18 +409,23 @@ private:
 
     enum class SlotState : std::uint8_t { free, filling, ready, failed };
 
-    /// One immutable-source binding: the SourceId/extent/resolver a fill reads through, plus the
-    /// TransferSet(s) submitted fills actually run on. Table keeps at most a "current" and one
+    /// One immutable-source binding: the (possibly sharded) source set/resolver a fill reads through,
+    /// plus one TransferSet per shard fills actually run on. Table keeps at most a "current" and one
     /// "retiring" binding alive at once (see invalidate()). Heap-allocated (via unique_ptr, not a plain
     /// member) so a raw Binding* captured by an in-flight Slot stays valid across invalidate() moving
     /// which unique_ptr "current"/"retiring" point at -- only the pointee's lifetime matters, and it
     /// never moves once created.
+    ///
+    /// Every shard's row_transfer/scratch_transfer is registered over the SAME output_storage/
+    /// scratch_storage span (docs/integration-plan.md's extended R18 note): at most one of them is ever
+    /// submitted-into for a given slot at a time, because Table alone decides which slot (and thus which
+    /// destination byte range) is live, and a Filling slot is never reclaimed regardless of which shard
+    /// or binding started its fetch.
     struct Binding {
-        sub0mempage::SourceId source{};
-        std::uint64_t source_bytes = 0;
+        std::vector<ShardSource> sources;
         RowExtentResolverRef resolver;
-        std::unique_ptr<sub0mempage::TransferSet> row_transfer;     // identity: straight into output_storage
-        std::unique_ptr<sub0mempage::TransferSet> scratch_transfer; // conversion only; null iff identity
+        std::vector<std::unique_ptr<sub0mempage::TransferSet>> row_transfers;     // identity; one per shard
+        std::vector<std::unique_ptr<sub0mempage::TransferSet>> scratch_transfers; // conversion; one per shard
         std::uint32_t in_flight = 0; ///< Slots currently Filling under this exact binding.
     };
 
@@ -463,7 +508,7 @@ private:
     [[nodiscard]] std::span<std::byte> scratch_span(std::uint32_t index) const noexcept {
         return config_.scratch_storage.subspan(std::size_t{index} * config_.source_row_bytes, config_.source_row_bytes);
     }
-    [[nodiscard]] std::unique_ptr<Binding> make_binding(sub0mempage::SourceId source, std::uint64_t source_bytes,
+    [[nodiscard]] std::unique_ptr<Binding> make_binding(std::span<const ShardSource> sources,
                                                         RowExtentResolverRef resolver,
                                                         Status& error) noexcept;
 
@@ -575,10 +620,15 @@ inline void PrefetchTicket::reset() noexcept {
 inline std::expected<std::unique_ptr<Table>, Status> Table::create(const TableConfig& config,
                                                                     sub0mempage::FillBackendRef backend) {
     if (config.row_count == 0 || config.source_row_bytes == 0 || config.output_row_bytes == 0 ||
-        config.source_bytes == 0 || config.budget_rows == 0 || config.max_tickets == 0 ||
+        config.sources.empty() || config.budget_rows == 0 || config.max_tickets == 0 ||
         config.max_batch_rows == 0 || config.budget_rows >= NONE || config.max_tickets >= NONE ||
         !config.resolve_extent.valid()) {
         return std::unexpected(Status::invalid_argument);
+    }
+    for (const ShardSource& shard : config.sources) {
+        if (shard.bytes == 0) {
+            return std::unexpected(Status::invalid_argument);
+        }
     }
     if (config.max_batch_rows > SIZE_MAX / config.max_tickets ||
         std::size_t{config.max_batch_rows} * config.max_tickets >= NONE) {
@@ -623,35 +673,50 @@ inline std::expected<std::unique_ptr<Table>, Status> Table::create(const TableCo
     return table;
 }
 
-inline std::unique_ptr<Table::Binding> Table::make_binding(sub0mempage::SourceId source, std::uint64_t source_bytes,
+inline std::unique_ptr<Table::Binding> Table::make_binding(std::span<const ShardSource> sources,
                                                             RowExtentResolverRef resolver, Status& error) noexcept {
-    if (source_bytes == 0) {
+    if (sources.empty()) {
         error = Status::invalid_argument;
         return nullptr;
     }
-    auto binding = std::make_unique<Binding>();
-    binding->source = source;
-    binding->source_bytes = source_bytes;
-    binding->resolver = resolver;
-    auto row_transfer = sub0mempage::TransferSet::create(
-        {.source = source, .source_bytes = source_bytes, .destination = config_.output_storage,
-         .max_claims = config_.budget_rows},
-        backend_);
-    if (!row_transfer) {
-        error = detail::from_mempage(row_transfer.error());
-        return nullptr;
-    }
-    binding->row_transfer = std::move(*row_transfer);
-    if (active_codec_ != nullptr) {
-        auto scratch_transfer = sub0mempage::TransferSet::create(
-            {.source = source, .source_bytes = source_bytes, .destination = config_.scratch_storage,
-             .max_claims = config_.scratch_rows},
-            backend_);
-        if (!scratch_transfer) {
-            error = detail::from_mempage(scratch_transfer.error());
+    for (const ShardSource& shard : sources) {
+        if (shard.bytes == 0) {
+            error = Status::invalid_argument;
             return nullptr;
         }
-        binding->scratch_transfer = std::move(*scratch_transfer);
+    }
+    auto binding = std::make_unique<Binding>();
+    binding->sources.assign(sources.begin(), sources.end()); // administrative: may allocate (file comment)
+    binding->resolver = resolver;
+    binding->row_transfers.reserve(sources.size());
+    if (active_codec_ != nullptr) {
+        binding->scratch_transfers.reserve(sources.size());
+    }
+    // Every shard's TransferSet(s) share the SAME output_storage/scratch_storage span (Binding's own
+    // comment, and the extended R18 note in docs/integration-plan.md): safe because a slot's destination
+    // byte range is only ever submitted-into through whichever shard's TransferSet a given fetch uses,
+    // and Table alone decides which slot is live at any moment.
+    for (const ShardSource& shard : sources) {
+        auto row_transfer = sub0mempage::TransferSet::create(
+            {.source = shard.source, .source_bytes = shard.bytes, .destination = config_.output_storage,
+             .max_claims = config_.budget_rows},
+            backend_);
+        if (!row_transfer) {
+            error = detail::from_mempage(row_transfer.error());
+            return nullptr;
+        }
+        binding->row_transfers.push_back(std::move(*row_transfer));
+        if (active_codec_ != nullptr) {
+            auto scratch_transfer = sub0mempage::TransferSet::create(
+                {.source = shard.source, .source_bytes = shard.bytes, .destination = config_.scratch_storage,
+                 .max_claims = config_.scratch_rows},
+                backend_);
+            if (!scratch_transfer) {
+                error = detail::from_mempage(scratch_transfer.error());
+                return nullptr;
+            }
+            binding->scratch_transfers.push_back(std::move(*scratch_transfer));
+        }
     }
     error = Status::ok;
     return binding;
@@ -673,7 +738,7 @@ inline Table::Table(Passkey, const TableConfig& config, sub0mempage::FillBackend
                                                                             : config_.codec;
 
     Status error = Status::ok;
-    current_binding_ = make_binding(config_.source, config_.source_bytes, config_.resolve_extent, error);
+    current_binding_ = make_binding(config_.sources, config_.resolve_extent, error);
     // create() checks current_binding_ != nullptr and reports invalid_argument; nothing else to do here.
 
     // The completion worker (see the file comment's coalescing note) is started last, once every other
@@ -839,16 +904,27 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
         return status;
     };
 
-    const auto extent = current_binding_->resolver.resolve(row_index);
-    if (!extent) {
-        return fail(extent.error());
+    const auto location = current_binding_->resolver.resolve(row_index);
+    if (!location) {
+        return fail(location.error());
     }
-    if (extent->length != config_.source_row_bytes) {
+    const std::uint32_t shard = location->shard;
+    if (shard >= current_binding_->sources.size()) {
+        return fail(Status::out_of_range); // the resolver named a shard this binding never registered
+    }
+    if (location->range.length != config_.source_row_bytes) {
         return fail(Status::invalid_argument);
+    }
+    // Defense in depth: TransferSet::submit below already validates the range against ITS OWN
+    // source_bytes for this exact shard, but checking here first gives a more specific diagnosis and
+    // avoids ever calling submit() with a location the caller's own resolver got wrong.
+    if (location->range.offset > current_binding_->sources[shard].bytes ||
+        location->range.length > current_binding_->sources[shard].bytes - location->range.offset) {
+        return fail(Status::out_of_range);
     }
 
     if (active_codec_ == nullptr) {
-        auto claim = current_binding_->row_transfer->submit(*extent, std::uint64_t{slot} * config_.output_row_bytes);
+        auto claim = current_binding_->row_transfers[shard]->submit(location->range, std::uint64_t{slot} * config_.output_row_bytes);
         if (!claim) {
             return fail(detail::from_mempage(claim.error()));
         }
@@ -860,7 +936,8 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
         if (scratch == NONE) {
             return fail(Status::pool_exhausted);
         }
-        auto claim = current_binding_->scratch_transfer->submit(*extent, std::uint64_t{scratch} * config_.source_row_bytes);
+        auto claim = current_binding_->scratch_transfers[shard]->submit(location->range,
+                                                                        std::uint64_t{scratch} * config_.source_row_bytes);
         if (!claim) {
             release_scratch(scratch);
             return fail(detail::from_mempage(claim.error()));
@@ -1323,10 +1400,15 @@ inline WaitOutcome Table::wait(const PrefetchTicket& ticket, Deadline deadline) 
     return outcome;
 }
 
-inline Status Table::invalidate(std::uint64_t new_generation, sub0mempage::SourceId new_source,
-                                std::uint64_t new_source_bytes, RowExtentResolverRef new_resolver) noexcept {
-    if (new_source_bytes == 0) {
+inline Status Table::invalidate(std::uint64_t new_generation, std::span<const ShardSource> new_sources,
+                                RowExtentResolverRef new_resolver) noexcept {
+    if (new_sources.empty()) {
         return Status::invalid_argument;
+    }
+    for (const ShardSource& shard : new_sources) {
+        if (shard.bytes == 0) {
+            return Status::invalid_argument;
+        }
     }
     const std::scoped_lock lock(lock_);
     if (retiring_binding_ != nullptr && retiring_binding_->in_flight != 0) {
@@ -1338,7 +1420,7 @@ inline Status Table::invalidate(std::uint64_t new_generation, sub0mempage::Sourc
 
     const RowExtentResolverRef resolver = new_resolver.valid() ? new_resolver : current_binding_->resolver;
     Status error = Status::ok;
-    std::unique_ptr<Binding> new_binding = make_binding(new_source, new_source_bytes, resolver, error);
+    std::unique_ptr<Binding> new_binding = make_binding(new_sources, resolver, error);
     if (new_binding == nullptr) {
         return error;
     }

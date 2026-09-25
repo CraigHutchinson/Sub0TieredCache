@@ -50,8 +50,9 @@ target_compile_features(Sub0TieredCache INTERFACE cxx_std_23)
 #     -DFETCHCONTENT_SOURCE_DIR_SUB0MEMPAGE=/path/to/Sub0MemPage \
 #     -DFETCHCONTENT_FULLY_DISCONNECTED=ON
 # Bumped for T1: Sub0MemPage's M3 slice 1 (local_file_backend.hpp) and its exported
-# Sub0MemPage::testing target (testing/include/sub0mempage/testing/fake_backend.hpp).
-set(SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION "69227db3cf7c37a6908e46cfbd71dda14c926c20"
+# Sub0MemPage::testing target (testing/include/sub0mempage/testing/fake_backend.hpp), merged to main
+# via PR #1.
+set(SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION "213acdd2121cec369c6b9606c514db2231e94f27"
     CACHE STRING "Pinned Sub0MemPage commit (docs/integration-plan.md acceptance order).")
 
 if(NOT IS_SUBPROJECT)
