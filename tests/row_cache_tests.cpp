@@ -4,7 +4,7 @@
 // against codec.hpp's own implementation -- see the cross-project "no copied implementation becomes its
 // own correctness oracle" rule).
 
-#include "fake_backend.hpp"
+#include <sub0mempage/testing/fake_backend.hpp>
 #include "test_support.hpp"
 
 #include <sub0tieredcache/sub0tieredcache.hpp>
@@ -138,7 +138,7 @@ void test_bounds() {
     IdentityFixture f;
     BackgroundCompleter pump(f.backend);
     std::vector<RowLease> out(1);
-    auto result = f.table->resolve_into(std::array{f.row_count}, out); // == row_count is out of range
+    auto result = f.table->resolve_into(std::array<std::uint64_t, 1>{f.row_count}, out); // == row_count is out of range
     check(!result.has_value() && result.error() == Status::out_of_range, "row_index == row_count is out of range");
     check(!out[0].is_held(), "no lease held after an out-of-range request");
 
@@ -167,7 +167,7 @@ void test_budget_exhaustion_is_all_or_nothing() {
     check(first.has_value(), "filling the whole budget succeeds");
 
     std::vector<RowLease> out(1);
-    auto third = f.table->resolve_into(std::array{std::uint64_t{2}}, out);
+    auto third = f.table->resolve_into(std::array<std::uint64_t, 1>{2}, out);
     check(!third.has_value() && third.error() == Status::pool_exhausted,
           "a third distinct row cannot evict two pinned rows out of a 2-row budget");
     check(!out[0].is_held(), "the failed call leaves no lease held (R14 all-or-nothing)");
@@ -182,14 +182,14 @@ void test_row_lease_lifetime_blocks_eviction() {
     IdentityFixture f(/*rows=*/20, /*bytes=*/8, /*budget=*/1);
     BackgroundCompleter pump(f.backend);
     std::vector<RowLease> out(1);
-    check(f.table->resolve_into(std::array{std::uint64_t{0}}, out).has_value(), "row 0 fills the single slot");
+    check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, out).has_value(), "row 0 fills the single slot");
 
     std::vector<RowLease> other(1);
-    auto blocked = f.table->resolve_into(std::array{std::uint64_t{1}}, other);
+    auto blocked = f.table->resolve_into(std::array<std::uint64_t, 1>{1}, other);
     check(!blocked.has_value() && blocked.error() == Status::pool_exhausted, "the pinned row cannot be evicted");
 
     out[0].reset(); // release row 0's lease
-    check(f.table->resolve_into(std::array{std::uint64_t{1}}, other).has_value(),
+    check(f.table->resolve_into(std::array<std::uint64_t, 1>{1}, other).has_value(),
           "row 1 can now claim the freed slot");
 }
 
@@ -197,13 +197,13 @@ void test_generations() {
     IdentityFixture f(/*rows=*/20, /*bytes=*/8, /*budget=*/2);
     BackgroundCompleter pump(f.backend);
     std::vector<RowLease> gen1(1);
-    check(f.table->resolve_into(std::array{std::uint64_t{0}}, gen1).has_value(), "row 0 resolves under generation 1");
+    check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen1).has_value(), "row 0 resolves under generation 1");
     check(gen1[0].generation() == 1, "the lease captures generation 1");
 
     check(f.table->invalidate(2, SourceId{1}, f.row_count * f.row_bytes) == Status::ok,
           "invalidate succeeds with a same-shaped new source binding");
     std::vector<RowLease> gen2(1);
-    check(f.table->resolve_into(std::array{std::uint64_t{0}}, gen2).has_value(),
+    check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen2).has_value(),
           "row 0 resolves again under generation 2 while the generation-1 lease is still held");
     check(gen2[0].generation() == 2, "the new lease captures generation 2");
     check(matches_source(gen1[0].bytes(), 0), "the old lease's bytes are still valid and unchanged");
@@ -215,11 +215,11 @@ void test_generation_budget_conflict_is_rejected() {
     IdentityFixture f(/*rows=*/20, /*bytes=*/8, /*budget=*/1);
     BackgroundCompleter pump(f.backend);
     std::vector<RowLease> gen1(1);
-    check(f.table->resolve_into(std::array{std::uint64_t{0}}, gen1).has_value(), "row 0 resolves under generation 1");
+    check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen1).has_value(), "row 0 resolves under generation 1");
 
     check(f.table->invalidate(2, SourceId{1}, f.row_count * f.row_bytes) == Status::ok, "invalidate succeeds");
     std::vector<RowLease> gen2(1);
-    auto result = f.table->resolve_into(std::array{std::uint64_t{0}}, gen2);
+    auto result = f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen2);
     check(!result.has_value() && result.error() == Status::pool_exhausted,
           "R4: a budget too small for both live generations is rejected explicitly, never overcommitted");
 }
@@ -254,7 +254,7 @@ void test_codec_failure_publishes_nothing() {
 
     test::BackgroundCompleter pump(backend);
     std::vector<RowLease> out(1);
-    auto result = table->resolve_into(std::array{std::uint64_t{0}}, out);
+    auto result = table->resolve_into(std::array<std::uint64_t, 1>{0}, out);
     check(!result.has_value() && result.error() == Status::codec_failed, "a failing codec reports codec_failed");
     check(!out[0].is_held(), "nothing is published when the codec fails (R14)");
     check(table->stats().codec_failures == 1, "the failure is observable via stats() (R10)");
@@ -266,7 +266,7 @@ void test_try_get_never_touches_transport() {
     check(!f.table->try_get(0).has_value(), "try_get misses on a row nobody has fetched");
     check(f.backend.accepted() == 0, "a plain miss never touches the transport (R11)");
 
-    auto ticket = f.table->prefetch(std::array{std::uint64_t{0}});
+    auto ticket = f.table->prefetch(std::array<std::uint64_t, 1>{0});
     check(ticket.has_value(), "prefetch submits without blocking");
     check(f.backend.accepted() == 1, "prefetch did submit the underlying fetch");
     check(!f.table->try_get(0).has_value(), "a still-filling row is reported as a miss, not awaited (R11)");
@@ -314,7 +314,7 @@ void test_bf16_to_f32_bit_exact() {
     // own delivered bytes through a widening formula written here, separately from codec.hpp.
     test::BackgroundCompleter pump(backend);
     std::vector<RowLease> out(1);
-    auto result = table->resolve_into(std::array{std::uint64_t{0}}, out);
+    auto result = table->resolve_into(std::array<std::uint64_t, 1>{0}, out);
     check(result.has_value(), "bf16_to_f32 conversion succeeds");
     check(table->stats().conversions == 1, "the conversion is counted (R10)");
 
@@ -370,7 +370,7 @@ void test_stats_snapshot() {
     check(stats1.fetches == 2 && stats1.resident == 2 && stats1.leased == 2, "fresh fetches are counted and resident/leased");
 
     std::vector<RowLease> hit(1);
-    check(f.table->resolve_into(std::array{std::uint64_t{0}}, hit).has_value(), "resolve the same row again");
+    check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, hit).has_value(), "resolve the same row again");
     auto stats2 = f.table->stats();
     check(stats2.hits == 1 && stats2.fetches == 2, "a second resolve of an already-Ready row is a hit, not a fetch");
 }

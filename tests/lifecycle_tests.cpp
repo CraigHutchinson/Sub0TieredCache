@@ -6,7 +6,7 @@
 //   5. wait() honours its own deadline even when it becomes the finisher.
 //   6. RowCache holds independent tables; WaitOutcome reports "evicted" for a reclaimed prefetch.
 
-#include "fake_backend.hpp"
+#include <sub0mempage/testing/fake_backend.hpp>
 #include "test_support.hpp"
 
 #include <sub0tieredcache/sub0tieredcache.hpp>
@@ -109,7 +109,7 @@ struct IdentityFixture {
 void test_dropped_prefetch_ticket_still_completes() {
     IdentityFixture f(/*rows=*/20, /*bytes=*/8, /*budget=*/2);
     {
-        auto ticket = f.table->prefetch(std::array{std::uint64_t{5}});
+        auto ticket = f.table->prefetch(std::array<std::uint64_t, 1>{5});
         check(ticket.has_value(), "prefetch admits row 5");
         // `ticket` is dropped here without ever being waited on.
     }
@@ -189,7 +189,7 @@ void test_transient_failure_then_retry_succeeds() {
     {
         std::thread attempt([&] {
             std::vector<RowLease> out(1);
-            auto result = table->resolve_into(std::array{std::uint64_t{1}}, out);
+            auto result = table->resolve_into(std::array<std::uint64_t, 1>{1}, out);
             check(!result.has_value() && result.error() == Status::io_error,
                   "a transient transport failure is reported, not silently retried");
         });
@@ -204,7 +204,7 @@ void test_transient_failure_then_retry_succeeds() {
     {
         test::BackgroundCompleter pump(backend);
         std::vector<RowLease> out(1);
-        auto result = table->resolve_into(std::array{std::uint64_t{1}}, out);
+        auto result = table->resolve_into(std::array<std::uint64_t, 1>{1}, out);
         check(result.has_value(), "R14: reads repeated after a failure are allowed, and this retry succeeds");
     }
     (void)table->drain();
@@ -231,14 +231,14 @@ void test_prefetch_admission_failure_slot_is_reclaimable() {
     cfg.max_batch_rows = 1;
     auto table = std::move(*Table::create(cfg, FillBackendRef(backend)));
 
-    auto ticket = table->prefetch(std::array{std::uint64_t{0}}); // row 0's resolver deliberately fails
+    auto ticket = table->prefetch(std::array<std::uint64_t, 1>{0}); // row 0's resolver deliberately fails
     check(ticket.has_value(), "prefetch itself succeeds; the failure is per-row, recorded on the slot");
     auto outcome = table->wait(*ticket);
     check(outcome.status != Status::ok && outcome.failed == 1, "row 0's admission failure is reported by wait()");
 
     test::BackgroundCompleter pump(backend);
     std::vector<RowLease> out(1);
-    auto result = table->resolve_into(std::array{std::uint64_t{1}}, out);
+    auto result = table->resolve_into(std::array<std::uint64_t, 1>{1}, out);
     check(result.has_value(), "the only slot was reclaimed for row 1 -- not leaked as a permanently-Failed slot");
     (void)table->drain();
 }
@@ -270,7 +270,7 @@ void test_invalidate_new_source_old_lease_unaffected() {
     test::BackgroundCompleter pump(backend);
 
     std::vector<RowLease> gen1(1);
-    check(table->resolve_into(std::array{std::uint64_t{2}}, gen1).has_value(), "row 2 resolves under generation 1");
+    check(table->resolve_into(std::array<std::uint64_t, 1>{2}, gen1).has_value(), "row 2 resolves under generation 1");
     check(gen1[0].generation() == 1, "the lease captures generation 1");
     const std::vector<std::byte> gen1_bytes(gen1[0].bytes().begin(), gen1[0].bytes().end());
 
@@ -278,7 +278,7 @@ void test_invalidate_new_source_old_lease_unaffected() {
           "invalidate succeeds with a new source and resolver");
 
     std::vector<RowLease> gen2(1);
-    check(table->resolve_into(std::array{std::uint64_t{2}}, gen2).has_value(), "row 2 resolves fresh under generation 2");
+    check(table->resolve_into(std::array<std::uint64_t, 1>{2}, gen2).has_value(), "row 2 resolves fresh under generation 2");
     check(gen2[0].generation() == 2, "the new lease captures generation 2");
     check(!std::equal(gen1_bytes.begin(), gen1_bytes.end(), gen2[0].bytes().begin()),
           "generation 2 reads a genuinely different source snapshot, not a re-read of the old one");
@@ -310,7 +310,7 @@ void test_invalidate_busy_while_retiring_in_flight() {
     auto table = std::move(*Table::create(cfg, FillBackendRef(backend)));
 
     // No BackgroundCompleter yet: row 0's fetch is deliberately left in flight under generation 1.
-    auto ticket = table->prefetch(std::array{std::uint64_t{0}});
+    auto ticket = table->prefetch(std::array<std::uint64_t, 1>{0});
     check(ticket.has_value(), "row 0's fetch starts under generation 1");
 
     check(table->invalidate(2, SourceId{13}, row_count * row_bytes) == Status::ok,
@@ -351,7 +351,7 @@ void test_wait_deadline_leaves_row_pending() {
     auto table = std::move(*Table::create(cfg, FillBackendRef(backend)));
 
     // No BackgroundCompleter: the fetch is deliberately never completed until after the deadline.
-    auto ticket = table->prefetch(std::array{std::uint64_t{0}});
+    auto ticket = table->prefetch(std::array<std::uint64_t, 1>{0});
     check(ticket.has_value(), "row 0's fetch starts");
     const auto outcome = table->wait(*ticket, Clock::now() + std::chrono::milliseconds(50));
     check(outcome.status == Status::timeout && outcome.pending == 1,
@@ -404,7 +404,7 @@ void test_row_cache_multiple_tables_are_independent() {
 
     test::BackgroundCompleter pump(backend);
     std::vector<RowLease> out_a(1);
-    check(cache.table(*handle_a)->resolve_into(std::array{std::uint64_t{0}}, out_a).has_value(),
+    check(cache.table(*handle_a)->resolve_into(std::array<std::uint64_t, 1>{0}, out_a).has_value(),
           "table A resolves row 0 through its own binding");
     check(!cache.table(*handle_b)->try_get(0).has_value(), "table B's own cache is untouched by table A's activity");
     check(cache.table(*handle_a)->stats().fetches == 1 && cache.table(*handle_b)->stats().fetches == 0,
@@ -416,13 +416,13 @@ void test_row_cache_multiple_tables_are_independent() {
 void test_wait_outcome_evicted() {
     IdentityFixture f(/*rows=*/20, /*bytes=*/8, /*budget=*/1);
     BackgroundCompleter pump(f.backend);
-    auto ticket = f.table->prefetch(std::array{std::uint64_t{0}});
+    auto ticket = f.table->prefetch(std::array<std::uint64_t, 1>{0});
     check(ticket.has_value(), "prefetch admits row 0 into the only slot");
     check(f.table->drain() == Status::ok, "the completion worker drives it to Ready on its own");
     check(f.table->stats().resident == 1, "row 0 is resident and unpinned (prefetch never pins, R6)");
 
     std::vector<RowLease> out(1);
-    check(f.table->resolve_into(std::array{std::uint64_t{1}}, out).has_value(),
+    check(f.table->resolve_into(std::array<std::uint64_t, 1>{1}, out).has_value(),
           "row 1 forces eviction of row 0's now-Ready, unpinned, unreferenced slot (budget == 1)");
 
     const auto outcome = f.table->wait(*ticket);

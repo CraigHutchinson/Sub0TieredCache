@@ -4,7 +4,7 @@ find_package(Threads REQUIRED)
 # Sub0MemPage's own tests/CMakeLists.txt exactly (STYLE_GUIDE.md).
 function(sub0tieredcache_add_test name source)
     add_executable(${name} ${source} allocation_counter.cpp)
-    target_link_libraries(${name} PRIVATE Sub0TieredCache::Sub0TieredCache Threads::Threads)
+    target_link_libraries(${name} PRIVATE Sub0TieredCache::Sub0TieredCache Sub0MemPage::testing Threads::Threads)
     target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     if(MSVC)
         target_compile_options(${name} PRIVATE /W4 /WX)

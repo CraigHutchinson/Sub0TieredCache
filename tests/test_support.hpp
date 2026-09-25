@@ -12,7 +12,7 @@
  *  follow the same rule. allocation_counter.cpp replaces global operator new in every test executable.
  */
 
-#include "fake_backend.hpp"
+#include <sub0mempage/testing/fake_backend.hpp>
 
 #include <atomic>
 #include <chrono>

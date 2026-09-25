@@ -108,18 +108,11 @@ None of these blocked T0 -- each was worked around locally, as noted -- but they
 contract as shipped, not just style preferences, so they are recorded here rather than silently patched
 around forever.
 
-- **No installed/exported test-support target for the deterministic fake backend.** `tests/fake_backend.hpp`
-  and `tests/test_support.hpp` are exactly the fixture a caller one layer up needs to test its own M2
-  usage (this project's own tests do, byte-for-byte copied into `tests/fake_backend.hpp` here), but
-  Sub0MemPage's `CMakeLists.txt` never installs or exports them -- they only exist inside its own
-  `tests/` directory, which `SUB0MEMPAGE_BUILD_TESTING=OFF` (this project's own FetchContent setup) does
-  not even configure. **Ask**: export an INTERFACE target, e.g. `Sub0MemPage::testing`, carrying
-  `include/../tests/fake_backend.hpp`-equivalent headers, so T0 (and later T1) can depend on the real
-  thing instead of a maintained copy that can silently drift from the original. Until that lands, T0's
-  copy in `tests/fake_backend.hpp` is explicitly marked as a copy-to-delete, per the cross-project plan's
-  "no copied implementation becomes its own correctness oracle" rule -- it is used only as a transport
-  test double (a source of bytes and completion timing), never as the oracle a codec or row result is
-  checked against.
+- ~~No installed/exported test-support target for the deterministic fake backend.~~ **RESOLVED** (T1,
+  Sub0MemPage commit `69227db3cf7c37a6908e46cfbd71dda14c926c20`): Sub0MemPage now exports
+  `Sub0MemPage::testing`, an INTERFACE target carrying `<sub0mempage/testing/fake_backend.hpp>`. T0's
+  hand-maintained copy in `tests/fake_backend.hpp` has been deleted; every test now links
+  `Sub0MemPage::testing` and includes the real header directly.
 - **A blocking scratch-pool acquisition inside `TransferSet::submit`'s critical section would deadlock
   a caller's own single global lock.** Not a Sub0MemPage bug -- `TransferSet` itself has no such
   blocking call -- but T0's own conversion path needed a bounded raw-byte staging pool *around*

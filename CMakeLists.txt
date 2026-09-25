@@ -49,7 +49,9 @@ target_compile_features(Sub0TieredCache INTERFACE cxx_std_23)
 #   cmake --preset default \
 #     -DFETCHCONTENT_SOURCE_DIR_SUB0MEMPAGE=/path/to/Sub0MemPage \
 #     -DFETCHCONTENT_FULLY_DISCONNECTED=ON
-set(SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION "2340409b43db2cb03efe6d586a50f4ced5114b73"
+# Bumped for T1: Sub0MemPage's M3 slice 1 (local_file_backend.hpp) and its exported
+# Sub0MemPage::testing target (testing/include/sub0mempage/testing/fake_backend.hpp).
+set(SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION "69227db3cf7c37a6908e46cfbd71dda14c926c20"
     CACHE STRING "Pinned Sub0MemPage commit (docs/integration-plan.md acceptance order).")
 
 if(NOT IS_SUBPROJECT)

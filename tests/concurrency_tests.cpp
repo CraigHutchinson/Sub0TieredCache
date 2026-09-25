@@ -3,7 +3,7 @@
 // sec 10: "A concurrency claim needs an actual concurrent test" -- this drives a real multithreaded
 // repeated-row workload and asserts the resulting fetch count, not just that the answer is correct.
 
-#include "fake_backend.hpp"
+#include <sub0mempage/testing/fake_backend.hpp>
 #include "test_support.hpp"
 
 #include <sub0tieredcache/sub0tieredcache.hpp>
@@ -71,7 +71,7 @@ void test_concurrent_same_row_coalesces() {
         threads.emplace_back([&] {
             for (int i = 0; i < requests_per_thread; ++i) {
                 std::vector<RowLease> out(1);
-                auto result = table->resolve_into(std::array{std::uint64_t{0}}, out);
+                auto result = table->resolve_into(std::array<std::uint64_t, 1>{0}, out);
                 if (!result.has_value() || out[0].row_index() != 0) {
                     mismatches.fetch_add(1, std::memory_order_relaxed);
                     continue;
@@ -136,7 +136,7 @@ void test_concurrent_distinct_rows_each_fetch_once() {
             for (int i = 0; i < 40; ++i) {
                 const std::uint64_t row = pick(rng);
                 std::vector<RowLease> out(1);
-                auto result = table->resolve_into(std::array{row}, out);
+                auto result = table->resolve_into(std::array<std::uint64_t, 1>{row}, out);
                 if (!result.has_value() || out[0].row_index() != row) {
                     failures.fetch_add(1, std::memory_order_relaxed);
                 }

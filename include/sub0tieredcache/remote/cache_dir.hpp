@@ -10,6 +10,15 @@
  */
 
 #include <cstdlib>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -18,12 +27,29 @@ namespace sub0tieredcache::remote {
 
 namespace detail {
 
-/// std::getenv wrapped so callers don't repeat the null-check; administrative/setup-time only.
-[[nodiscard]] inline std::string env_or_empty(const char* name) {
+/// Environment lookup wrapped so callers don't repeat the null-check; administrative/setup-time only.
+/// Windows reads the wide variable (non-ASCII profile paths) via GetEnvironmentVariableW, avoiding
+/// MSVC's deprecated getenv.
+[[nodiscard]] inline std::filesystem::path env_path_or_empty(const char* name) {
+#if defined(_WIN32)
+    const std::wstring wide(name, name + std::char_traits<char>::length(name));
+    const DWORD needed = ::GetEnvironmentVariableW(wide.c_str(), nullptr, 0);
+    if (needed == 0) {
+        return {};
+    }
+    std::wstring value(needed, L'\0');
+    const DWORD written = ::GetEnvironmentVariableW(wide.c_str(), value.data(), needed);
+    if (written == 0 || written >= needed) {
+        return {};
+    }
+    value.resize(written);
+    return std::filesystem::path(value);
+#else
     if (const char* value = std::getenv(name); value != nullptr) {
-        return std::string(value);
+        return std::filesystem::path(value);
     }
     return {};
+#endif
 }
 
 } // namespace detail
@@ -35,20 +61,20 @@ namespace detail {
 [[nodiscard]] inline std::filesystem::path default_user_cache_dir(std::string_view subdir = "Sub0TieredCache") {
 #if defined(_WIN32)
     // Windows: %LOCALAPPDATA% is the documented per-user, non-roaming cache location.
-    const std::string local_app_data = detail::env_or_empty("LOCALAPPDATA");
-    std::filesystem::path base = local_app_data.empty() ? std::filesystem::path(".") : std::filesystem::path(local_app_data);
+    const std::filesystem::path local_app_data = detail::env_path_or_empty("LOCALAPPDATA");
+    std::filesystem::path base = local_app_data.empty() ? std::filesystem::path(".") : local_app_data;
     return base / subdir;
 #elif defined(__APPLE__)
-    const std::string home = detail::env_or_empty("HOME");
-    std::filesystem::path base = home.empty() ? std::filesystem::path(".") : std::filesystem::path(home) / "Library" / "Caches";
+    const std::filesystem::path home = detail::env_path_or_empty("HOME");
+    std::filesystem::path base = home.empty() ? std::filesystem::path(".") : home / "Library" / "Caches";
     return base / subdir;
 #else
     // Linux and other POSIX: XDG Base Directory spec, falling back to ~/.cache.
-    if (const std::string xdg = detail::env_or_empty("XDG_CACHE_HOME"); !xdg.empty()) {
-        return std::filesystem::path(xdg) / subdir;
+    if (const std::filesystem::path xdg = detail::env_path_or_empty("XDG_CACHE_HOME"); !xdg.empty()) {
+        return xdg / subdir;
     }
-    const std::string home = detail::env_or_empty("HOME");
-    std::filesystem::path base = home.empty() ? std::filesystem::path(".") : std::filesystem::path(home) / ".cache";
+    const std::filesystem::path home = detail::env_path_or_empty("HOME");
+    std::filesystem::path base = home.empty() ? std::filesystem::path(".") : home / ".cache";
     return base / subdir;
 #endif
 }

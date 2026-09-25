@@ -3,7 +3,7 @@
 // operator new. Registration and the fetch/codec path (transport submission, codec conversion) are
 // administrative/steady-state-but-not-hot and are explicitly allowed to allocate.
 
-#include "fake_backend.hpp"
+#include <sub0mempage/testing/fake_backend.hpp>
 #include "test_support.hpp"
 
 #include <sub0tieredcache/sub0tieredcache.hpp>
@@ -79,7 +79,7 @@ void test_try_get_and_hit_resolve_never_allocate() {
     const std::uint64_t before_resolve = allocation_count();
     for (int i = 0; i < 1000; ++i) {
         std::array<RowLease, 1> out{};
-        auto result = table->resolve_into(std::array{std::uint64_t{0}}, out);
+        auto result = table->resolve_into(std::array<std::uint64_t, 1>{0}, out);
         check(result.has_value(), "resolve_into keeps hitting the resident row");
     }
     check(allocation_count() == before_resolve, "1000 resolve_into hits performed zero heap allocations");

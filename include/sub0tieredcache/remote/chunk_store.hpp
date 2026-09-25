@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <random>
 #include <span>
 #include <string>
 #include <system_error>
@@ -58,6 +59,21 @@ struct SourceIdentity {
 };
 
 namespace detail {
+
+/// fopen that takes the native path (wide on Windows, so non-ASCII paths work) and avoids MSVC's
+/// deprecated narrow fopen. `mode` is plain ASCII ("rb"/"wb").
+[[nodiscard]] inline std::FILE* open_file(const std::filesystem::path& path, const char* mode) noexcept {
+#if defined(_WIN32)
+    wchar_t wide_mode[4] = {};
+    for (std::size_t i = 0; i < 3 && mode[i] != '\0'; ++i) {
+        wide_mode[i] = static_cast<wchar_t>(mode[i]);
+    }
+    std::FILE* file = nullptr;
+    return _wfopen_s(&file, path.c_str(), wide_mode) == 0 ? file : nullptr;
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
 
 // Chunk file format v1. "STC1" magic distinguishes this library's files from anything else that
 // might share a cache directory; format_version lets a v2 reader recognize and reject a file it
@@ -168,7 +184,7 @@ public:
     [[nodiscard]] ReadResult read_chunk(const SourceIdentity& source, std::uint32_t chunk_index, std::span<std::byte> dest) const {
         std::scoped_lock lock(mutex_);
         const auto path = directory_ / detail::chunk_file_name(source, chunk_index);
-        std::FILE* f = std::fopen(path.string().c_str(), "rb");
+        std::FILE* f = detail::open_file(path, "rb");
         if (f == nullptr) {
             return {.status = Status::not_found};
         }
@@ -227,9 +243,9 @@ public:
         header.validator_length = static_cast<std::uint32_t>(validator_bytes.size());
         header.payload_checksum = fnv1a32(payload);
 
-        const auto temp_path = directory_ / (std::string(detail::kTempPrefix) + std::to_string(temp_counter_++) + "-" +
-                                              std::to_string(reinterpret_cast<std::uintptr_t>(this)));
-        std::FILE* f = std::fopen(temp_path.string().c_str(), "wb");
+        const auto temp_path = directory_ / (std::string(detail::kTempPrefix) + std::to_string(temp_nonce_) + "-" +
+                                              std::to_string(temp_counter_++));
+        std::FILE* f = detail::open_file(temp_path, "wb");
         if (f == nullptr) {
             return Status::publish_failed;
         }
@@ -275,6 +291,8 @@ private:
     bool valid_ = true;
     mutable std::mutex mutex_;
     mutable std::uint64_t temp_counter_ = 0;
+    /// Random per store, so two processes publishing into one directory never pick the same temp name.
+    std::uint64_t temp_nonce_ = (std::uint64_t{std::random_device{}()} << 32) ^ std::random_device{}();
 };
 
 } // namespace sub0tieredcache::remote
