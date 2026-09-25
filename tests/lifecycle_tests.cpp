@@ -31,11 +31,11 @@ using Backend = sub0mempage::test::FakeBackend;
 struct FixedWidthResolver {
     std::uint64_t row_bytes;
     std::uint64_t row_count;
-    [[nodiscard]] std::expected<ByteRange, Status> resolve_extent(std::uint64_t row) const noexcept {
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t row) const noexcept {
         if (row >= row_count) {
             return std::unexpected(Status::out_of_range);
         }
-        return ByteRange{row * row_bytes, row_bytes};
+        return RowLocation{0, ByteRange{row * row_bytes, row_bytes}};
     }
 };
 
@@ -48,11 +48,11 @@ struct OffsetResolver {
     std::uint64_t base;
     std::uint64_t row_bytes;
     std::uint64_t row_count;
-    [[nodiscard]] std::expected<ByteRange, Status> resolve_extent(std::uint64_t row) const noexcept {
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t row) const noexcept {
         if (row >= row_count) {
             return std::unexpected(Status::out_of_range);
         }
-        return ByteRange{base + row * row_bytes, row_bytes};
+        return RowLocation{0, ByteRange{base + row * row_bytes, row_bytes}};
     }
 };
 
@@ -61,11 +61,11 @@ struct OffsetResolver {
 struct BadLengthResolver {
     std::uint64_t row_bytes;
     std::uint64_t row_count;
-    [[nodiscard]] std::expected<ByteRange, Status> resolve_extent(std::uint64_t row) const noexcept {
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t row) const noexcept {
         if (row >= row_count) {
             return std::unexpected(Status::out_of_range);
         }
-        return row == 0 ? ByteRange{0, row_bytes / 2} : ByteRange{row * row_bytes, row_bytes};
+        return row == 0 ? RowLocation{0, ByteRange{0, row_bytes / 2}} : RowLocation{0, ByteRange{row * row_bytes, row_bytes}};
     }
 };
 
@@ -87,8 +87,9 @@ struct IdentityFixture {
         cfg.source_row_bytes = row_bytes;
         cfg.output_row_bytes = row_bytes;
         cfg.representation = Representation::identity;
-        cfg.source = SourceId{1};
-        cfg.source_bytes = row_count * row_bytes;
+        const auto cfg_sources = single_source(SourceId{1}, row_count * row_bytes);
+        cfg.sources = cfg_sources;
+
         cfg.generation = 1;
         cfg.resolve_extent = RowExtentResolverRef(resolver);
         cfg.output_storage = output_storage;
@@ -176,8 +177,9 @@ void test_transient_failure_then_retry_succeeds() {
     cfg.source_row_bytes = row_bytes;
     cfg.output_row_bytes = row_bytes;
     cfg.representation = Representation::identity;
-    cfg.source = SourceId{9};
-    cfg.source_bytes = row_count * row_bytes;
+    const auto cfg_sources = single_source(SourceId{9}, row_count * row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -221,8 +223,9 @@ void test_prefetch_admission_failure_slot_is_reclaimable() {
     cfg.source_row_bytes = row_bytes;
     cfg.output_row_bytes = row_bytes;
     cfg.representation = Representation::identity;
-    cfg.source = SourceId{11};
-    cfg.source_bytes = row_count * row_bytes;
+    const auto cfg_sources = single_source(SourceId{11}, row_count * row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -258,8 +261,9 @@ void test_invalidate_new_source_old_lease_unaffected() {
     cfg.source_row_bytes = row_bytes;
     cfg.output_row_bytes = row_bytes;
     cfg.representation = Representation::identity;
-    cfg.source = SourceId{5};
-    cfg.source_bytes = source_bytes;
+    const auto cfg_sources = single_source(SourceId{5}, source_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver_v1);
     cfg.output_storage = output;
@@ -274,7 +278,7 @@ void test_invalidate_new_source_old_lease_unaffected() {
     check(gen1[0].generation() == 1, "the lease captures generation 1");
     const std::vector<std::byte> gen1_bytes(gen1[0].bytes().begin(), gen1[0].bytes().end());
 
-    check(table->invalidate(2, SourceId{6}, source_bytes, RowExtentResolverRef(resolver_v2)) == Status::ok,
+    check(table->invalidate(2, single_source(SourceId{6}, source_bytes), RowExtentResolverRef(resolver_v2)) == Status::ok,
           "invalidate succeeds with a new source and resolver");
 
     std::vector<RowLease> gen2(1);
@@ -299,8 +303,9 @@ void test_invalidate_busy_while_retiring_in_flight() {
     cfg.source_row_bytes = row_bytes;
     cfg.output_row_bytes = row_bytes;
     cfg.representation = Representation::identity;
-    cfg.source = SourceId{12};
-    cfg.source_bytes = row_count * row_bytes;
+    const auto cfg_sources = single_source(SourceId{12}, row_count * row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -313,16 +318,16 @@ void test_invalidate_busy_while_retiring_in_flight() {
     auto ticket = table->prefetch(std::array<std::uint64_t, 1>{0});
     check(ticket.has_value(), "row 0's fetch starts under generation 1");
 
-    check(table->invalidate(2, SourceId{13}, row_count * row_bytes) == Status::ok,
+    check(table->invalidate(2, single_source(SourceId{13}, row_count * row_bytes)) == Status::ok,
           "the first invalidate succeeds -- the still-in-flight fetch becomes the retiring binding's problem");
-    const auto busy = table->invalidate(3, SourceId{14}, row_count * row_bytes);
+    const auto busy = table->invalidate(3, single_source(SourceId{14}, row_count * row_bytes));
     check(busy == Status::busy,
           "R4: a second invalidate while the retiring binding still has an in-flight fetch is rejected, "
           "not silently losing track of the live transfer");
 
     backend.complete_all_newest_first();
     check(table->drain() == Status::ok, "the retiring generation's fetch still completes on its own");
-    check(table->invalidate(3, SourceId{14}, row_count * row_bytes) == Status::ok,
+    check(table->invalidate(3, single_source(SourceId{14}, row_count * row_bytes)) == Status::ok,
           "once the retiring binding has drained, invalidate succeeds again");
     (void)table->drain();
 }
@@ -340,8 +345,9 @@ void test_wait_deadline_leaves_row_pending() {
     cfg.source_row_bytes = row_bytes;
     cfg.output_row_bytes = row_bytes;
     cfg.representation = Representation::identity;
-    cfg.source = SourceId{15};
-    cfg.source_bytes = row_count * row_bytes;
+    const auto cfg_sources = single_source(SourceId{15}, row_count * row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -380,8 +386,9 @@ void test_row_cache_multiple_tables_are_independent() {
     cfg_a.source_row_bytes = row_bytes;
     cfg_a.output_row_bytes = row_bytes;
     cfg_a.representation = Representation::identity;
-    cfg_a.source = SourceId{20};
-    cfg_a.source_bytes = row_count * row_bytes;
+    const auto cfg_a_sources = single_source(SourceId{20}, row_count * row_bytes);
+    cfg_a.sources = cfg_a_sources;
+
     cfg_a.generation = 1;
     cfg_a.resolve_extent = RowExtentResolverRef(resolver_a);
     cfg_a.output_storage = output_a;
@@ -390,7 +397,8 @@ void test_row_cache_multiple_tables_are_independent() {
     cfg_a.max_batch_rows = 2;
 
     TableConfig cfg_b = cfg_a;
-    cfg_b.source = SourceId{21};
+    const auto cfg_b_sources = single_source(SourceId{21}, row_count * row_bytes);
+    cfg_b.sources = cfg_b_sources;
     cfg_b.resolve_extent = RowExtentResolverRef(resolver_b);
     cfg_b.output_storage = output_b;
 

@@ -29,11 +29,11 @@ using Backend = sub0mempage::test::FakeBackend;
 struct FixedWidthResolver {
     std::uint64_t row_bytes;
     std::uint64_t row_count;
-    [[nodiscard]] std::expected<ByteRange, Status> resolve_extent(std::uint64_t row) const noexcept {
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t row) const noexcept {
         if (row >= row_count) {
             return std::unexpected(Status::out_of_range);
         }
-        return ByteRange{row * row_bytes, row_bytes};
+        return RowLocation{0, ByteRange{row * row_bytes, row_bytes}};
     }
 };
 
@@ -54,8 +54,9 @@ void test_concurrent_same_row_coalesces() {
     cfg.source_row_bytes = row_bytes;
     cfg.output_row_bytes = row_bytes;
     cfg.representation = Representation::identity;
-    cfg.source = SourceId{7};
-    cfg.source_bytes = row_count * row_bytes;
+    const auto cfg_sources = single_source(SourceId{7}, row_count * row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -116,8 +117,9 @@ void test_concurrent_distinct_rows_each_fetch_once() {
     cfg.source_row_bytes = row_bytes;
     cfg.output_row_bytes = row_bytes;
     cfg.representation = Representation::identity;
-    cfg.source = SourceId{8};
-    cfg.source_bytes = row_count * row_bytes;
+    const auto cfg_sources = single_source(SourceId{8}, row_count * row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;

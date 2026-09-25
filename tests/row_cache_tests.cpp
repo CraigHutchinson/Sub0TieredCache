@@ -31,11 +31,11 @@ struct FixedWidthResolver {
     std::uint64_t row_bytes = 0;
     std::uint64_t row_count = 0;
 
-    [[nodiscard]] std::expected<ByteRange, Status> resolve_extent(std::uint64_t row) const noexcept {
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t row) const noexcept {
         if (row >= row_count) {
             return std::unexpected(Status::out_of_range);
         }
-        return ByteRange{row * row_bytes, row_bytes};
+        return RowLocation{0, ByteRange{row * row_bytes, row_bytes}};
     }
 };
 
@@ -65,8 +65,9 @@ struct IdentityFixture {
         cfg.source_row_bytes = row_bytes;
         cfg.output_row_bytes = row_bytes;
         cfg.representation = Representation::identity;
-        cfg.source = SourceId{1};
-        cfg.source_bytes = row_count * row_bytes;
+        const auto cfg_sources = single_source(SourceId{1}, row_count * row_bytes);
+        cfg.sources = cfg_sources;
+
         cfg.generation = 1;
         cfg.resolve_extent = RowExtentResolverRef(resolver);
         cfg.output_storage = output_storage;
@@ -100,8 +101,9 @@ void test_registration_validation() {
     cfg.source_row_bytes = 8;
     cfg.output_row_bytes = 8;
     cfg.representation = Representation::identity;
-    cfg.source = SourceId{1};
-    cfg.source_bytes = 16;
+    const auto cfg_sources = single_source(SourceId{1}, 16);
+    cfg.sources = cfg_sources;
+
     FixedWidthResolver resolver{8, 2};
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -200,7 +202,7 @@ void test_generations() {
     check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen1).has_value(), "row 0 resolves under generation 1");
     check(gen1[0].generation() == 1, "the lease captures generation 1");
 
-    check(f.table->invalidate(2, SourceId{1}, f.row_count * f.row_bytes) == Status::ok,
+    check(f.table->invalidate(2, single_source(SourceId{1}, f.row_count * f.row_bytes)) == Status::ok,
           "invalidate succeeds with a same-shaped new source binding");
     std::vector<RowLease> gen2(1);
     check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen2).has_value(),
@@ -217,7 +219,7 @@ void test_generation_budget_conflict_is_rejected() {
     std::vector<RowLease> gen1(1);
     check(f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen1).has_value(), "row 0 resolves under generation 1");
 
-    check(f.table->invalidate(2, SourceId{1}, f.row_count * f.row_bytes) == Status::ok, "invalidate succeeds");
+    check(f.table->invalidate(2, single_source(SourceId{1}, f.row_count * f.row_bytes)) == Status::ok, "invalidate succeeds");
     std::vector<RowLease> gen2(1);
     auto result = f.table->resolve_into(std::array<std::uint64_t, 1>{0}, gen2);
     check(!result.has_value() && result.error() == Status::pool_exhausted,
@@ -240,8 +242,9 @@ void test_codec_failure_publishes_nothing() {
     cfg.output_row_bytes = row_bytes; // widths are irrelevant to a custom codec's own contract
     cfg.representation = Representation::custom;
     cfg.codec = &codec;
-    cfg.source = SourceId{2};
-    cfg.source_bytes = row_count * row_bytes;
+    const auto cfg_sources = single_source(SourceId{2}, row_count * row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
@@ -296,8 +299,9 @@ void test_bf16_to_f32_bit_exact() {
     cfg.source_row_bytes = source_row_bytes;
     cfg.output_row_bytes = output_row_bytes;
     cfg.representation = Representation::bf16_to_f32;
-    cfg.source = SourceId{3};
-    cfg.source_bytes = source_row_bytes;
+    const auto cfg_sources = single_source(SourceId{3}, source_row_bytes);
+    cfg.sources = cfg_sources;
+
     cfg.generation = 1;
     cfg.resolve_extent = RowExtentResolverRef(resolver);
     cfg.output_storage = output;
