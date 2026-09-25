@@ -147,6 +147,40 @@ void test_bounds() {
     check(!f.table->try_get(f.row_count).has_value(), "try_get on an out-of-range row misses cleanly");
 }
 
+/// A resolver that names a shard index this table never registered (T1: sharded sources). Must fail
+/// cleanly, not index off the end of the binding's per-shard TransferSet/ShardSource vectors.
+struct OutOfRangeShardResolver {
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t) const noexcept {
+        return RowLocation{5, ByteRange{0, 8}}; // this table registers exactly one shard (index 0)
+    }
+};
+
+void test_resolver_naming_an_unregistered_shard_fails_cleanly() {
+    Backend backend(4);
+    OutOfRangeShardResolver resolver;
+    std::vector<std::byte> output(8);
+    TableConfig cfg{};
+    cfg.row_count = 1;
+    cfg.source_row_bytes = 8;
+    cfg.output_row_bytes = 8;
+    cfg.representation = Representation::identity;
+    const auto cfg_sources = single_source(SourceId{1}, 8);
+    cfg.sources = cfg_sources;
+    cfg.generation = 1;
+    cfg.resolve_extent = RowExtentResolverRef(resolver);
+    cfg.output_storage = output;
+    cfg.budget_rows = 1;
+    cfg.max_tickets = 1;
+    cfg.max_batch_rows = 1;
+    auto table = std::move(*Table::create(cfg, FillBackendRef(backend)));
+
+    std::array<RowLease, 1> out{};
+    auto result = table->resolve_into(std::array<std::uint64_t, 1>{0}, out);
+    check(!result.has_value() && result.error() == Status::out_of_range,
+          "a resolver naming an unregistered shard fails explicitly with out_of_range, never indexes off the end");
+    (void)table->drain();
+}
+
 void test_duplicate_and_order() {
     IdentityFixture f;
     BackgroundCompleter pump(f.backend);
@@ -384,6 +418,7 @@ void test_stats_snapshot() {
 int main() {
     run(test_registration_validation, "registration_validation");
     run(test_bounds, "bounds");
+    run(test_resolver_naming_an_unregistered_shard_fails_cleanly, "resolver_naming_an_unregistered_shard_fails_cleanly");
     run(test_duplicate_and_order, "duplicate_and_order");
     run(test_budget_exhaustion_is_all_or_nothing, "budget_exhaustion_is_all_or_nothing");
     run(test_row_lease_lifetime_blocks_eviction, "row_lease_lifetime_blocks_eviction");
