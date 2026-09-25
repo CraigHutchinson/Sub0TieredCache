@@ -75,9 +75,9 @@ owned and validated by Sub0Llm, not inferred by this cache.
 |---|---|---|---|---|
 | T0 | MemPage M2 contract | Bounded in-memory row cache + reference fixtures | Duplicate/order/bounds, budgets, RowLease lifetime, versions, codec failure; no engine/GPU/network | **Delivered** |
 | T1 | T0 + MemPage M3 | Local-file row adapter using real lower scheduler | Identical output to T0; tiny RAM forces eviction; cross-chunk contiguous gather, concurrent same-row coalescing, no hot allocations | **Delivered** (`tests/local_file_tests.cpp`, `local_file_source.hpp`); sharded sources (`ShardSource`/`RowLocation`) also landed here, ahead of the row above naming it explicitly. A **real external shard fixture** (a genuine multi-shard third-party format, not this repo's own synthetic flat/interleaved test files) is still open. |
-| T2 | T1 + MemPage M4 | GPU row representations and codec/event bridge | CPU/native-encoded/CUDA outputs match independent oracles; delayed-event reuse protection; staged path first | Not started |
+| T2 | T1 + MemPage M4 | GPU row representations and codec/event bridge | CPU/native-encoded/CUDA outputs match independent oracles; delayed-event reuse protection; staged path first | Not started: blocked on MemPage M4 (staged CUDA transport) and on CUDA hardware for qualification |
 | T3 | T1 | Optional remote mirror | Local HTTP server failure matrix and restart/version tests; real external shard fixture with provenance | **Standalone mirror delivered** (`include/sub0tieredcache/remote/`, `docs/remote-mirror.md`: versioned local chunk store over a built-in plain-HTTP client) **and integrated** (`remote/mirror_backend.hpp`, `tests/remote_e2e_tests.cpp`: network-then-disk-restart and a validator-mismatch-fails-explicitly case against the local HTTP test server). Open: HTTPS (the built-in client is plain HTTP only; TLS is left to a caller-supplied `RangeTransportRef`), and the same real external shard fixture T1 still needs. |
-| T4 | T1/T2 + MemPage M5/M6 | Intel or NVIDIA accelerated paths | Same row contract on each qualified backend; fallback telemetry and identical results; no hardware means not qualified | Not started |
+| T4 | T1/T2 + MemPage M5/M6 | Intel or NVIDIA accelerated paths | Same row contract on each qualified backend; fallback telemetry and identical results; no hardware means not qualified | Not started: blocked on MemPage M5/M6 and on Intel/NVIDIA hardware; not qualified |
 
 T0 can be authored while M2 stabilizes using a fake transport, but T1 cannot pass with only a fake.
 Sub0Llm's S0 fixture/adapter definition happens now; S1 local-row integration follows T1 rather than
@@ -103,25 +103,18 @@ working-set/reuse distance and concurrency needs back into T0/T1 fixtures, witho
 
 ### What has actually been verified where (T1/T3 pass)
 
-This container is Linux-only (no macOS, no native Windows), so "Windows/Linux/macOS host semantics must
-pass" above is checked as follows, honestly:
+Local work ran in a Linux container; Windows and macOS evidence comes from CI plus mingw-w64/Wine:
 
 - **Linux**: GCC 13 Release `-Wall -Wextra -Wpedantic -Werror`, Clang 18 (via `-stdlib=libc++` --
   system `libstdc++` under this Clang cannot compile `std::expected` at all, a real toolchain gap, not a
   code defect; see this file's own Sub0MemPage contract-feedback note), ASan+UBSan, and TSan (run
   multiple times) are all green for every test executable, including the real-file (`local_file_tests`)
   and real-network (`remote_e2e_tests`) suites.
-- **Windows**: not run on real Windows or under an emulator; instead cross-compiled with
-  `x86_64-w64-mingw32-g++-posix -std=c++23 -Wall -Wextra -Wpedantic -Werror` and executed under Wine
-  (`wine <test>.exe`), one test binary at a time, linked against `ws2_32` for the sockets the remote
-  transport/HTTP test server use. This exercises MinGW's libstdc++ (a different standard library build
-  than this container's native GCC) and Wine's Win32 socket/thread emulation, but it is not MSVC and not
-  real Win32 -- treat it as evidence of portability, not as the Windows CI gate itself (that already runs
-  in GitHub Actions per `.github/workflows/ci.yml`'s `build-windows` job, which this container cannot
-  reach).
-- **macOS**: entirely unverified in this environment. No macOS machine or emulator was available; the
-  code avoids any macOS-specific path (the local-file and remote-mirror backends are POSIX-portable, no
-  Linux-only syscalls), but that is a design intent, not a substitute for actually running it there.
+- **Windows**: GitHub Actions `build-windows` (MSVC, `/W4 /WX`) is the gate and passed on PR #1 (T0 + T3
+  standalone). Locally, every suite is also cross-compiled with mingw-w64 GCC 13 (`-Werror`) and run
+  under Wine, with check counts identical to Linux. That exercises a second standard library and the
+  Win32 file-sharing/socket semantics (it caught a test that grew a file another handle held open).
+- **macOS**: GitHub Actions `build-macos` passed on PR #1. No local macOS run.
 
 ## Contract feedback to Sub0MemPage (T0)
 
