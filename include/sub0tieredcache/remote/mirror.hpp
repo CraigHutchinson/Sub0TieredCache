@@ -58,7 +58,11 @@ public:
               .chunk_size = options.chunk_size,
           }) {}
 
-    [[nodiscard]] bool valid() const noexcept { return store_.valid() && store_.chunk_size() > 0; }
+    /// Chunk indices are 32-bit, so a source must fit in 2^32 chunks.
+    [[nodiscard]] bool valid() const noexcept {
+        return store_.valid() && store_.chunk_size() > 0 &&
+               source_.validator.total_size / store_.chunk_size() < UINT32_MAX;
+    }
 
     struct ReadOutcome {
         Status status = Status::ok;
@@ -158,7 +162,11 @@ private:
         }
 
         if (am_fetcher) {
-            const Status fetch_status = fetch_and_publish(chunk_index, chunk_len);
+            // A previous fetcher may have published and left inflight_ between our local miss above
+            // and our registering as fetcher; re-check so that window cannot cost a second fetch.
+            const Status fetch_status = store_.read_chunk(source_, chunk_index, chunk_buffer).status == Status::ok
+                                            ? Status::ok
+                                            : fetch_and_publish(chunk_index, chunk_len);
             {
                 std::scoped_lock lock(state->m);
                 state->status = fetch_status;
