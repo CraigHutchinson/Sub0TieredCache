@@ -100,3 +100,39 @@ native-Linux qualification, not a requirement imposed on macOS or Windows users.
 Each gate reports lower/upper repository revisions, fixture hashes, test/skip counts, seed, compiler and
 backend facts. No shared live file is mutated by two test processes. End-to-end traces feed row size,
 working-set/reuse distance and concurrency needs back into T0/T1 fixtures, without importing model code.
+
+## Contract feedback to Sub0MemPage (T0)
+
+Found while implementing T0 against the pinned Sub0MemPage revision (README.md records the exact commit).
+None of these blocked T0 -- each was worked around locally, as noted -- but they are real gaps in the M2
+contract as shipped, not just style preferences, so they are recorded here rather than silently patched
+around forever.
+
+- **No installed/exported test-support target for the deterministic fake backend.** `tests/fake_backend.hpp`
+  and `tests/test_support.hpp` are exactly the fixture a caller one layer up needs to test its own M2
+  usage (this project's own tests do, byte-for-byte copied into `tests/fake_backend.hpp` here), but
+  Sub0MemPage's `CMakeLists.txt` never installs or exports them -- they only exist inside its own
+  `tests/` directory, which `SUB0MEMPAGE_BUILD_TESTING=OFF` (this project's own FetchContent setup) does
+  not even configure. **Ask**: export an INTERFACE target, e.g. `Sub0MemPage::testing`, carrying
+  `include/../tests/fake_backend.hpp`-equivalent headers, so T0 (and later T1) can depend on the real
+  thing instead of a maintained copy that can silently drift from the original. Until that lands, T0's
+  copy in `tests/fake_backend.hpp` is explicitly marked as a copy-to-delete, per the cross-project plan's
+  "no copied implementation becomes its own correctness oracle" rule -- it is used only as a transport
+  test double (a source of bytes and completion timing), never as the oracle a codec or row result is
+  checked against.
+- **A blocking scratch-pool acquisition inside `TransferSet::submit`'s critical section would deadlock
+  a caller's own single global lock.** Not a Sub0MemPage bug -- `TransferSet` itself has no such
+  blocking call -- but T0's own conversion path needed a bounded raw-byte staging pool *around*
+  `TransferSet`, and the natural first design (a blocking acquire, mirroring how `SlotPool::resolve`
+  itself blocks) deadlocks against T0's own single-mutex admission path: a finisher thread can only free
+  a scratch slot by re-acquiring the same lock the blocked acquirer is holding. T0's own scratch pool is
+  therefore non-blocking (`Table::acquire_scratch` returns `pool_exhausted` immediately rather than
+  waiting) -- see `include/sub0tieredcache/row_cache.hpp`'s `acquire_scratch`/`start_fill_locked`
+  comments. This is recorded here because a future Sub0MemPage feature that lets a caller register a
+  *second*, smaller bounded pool alongside a `TransferSet` (for exactly this "raw stage then transform"
+  shape) would let T1 do this without T0 inventing its own parallel pool and mutex.
+- **No cross-instance guard yet that one allocation is not registered with both a `SlotPool` and a
+  `TransferSet` (R18)**, already flagged as deferred in Sub0MemPage's own `slot_pool.hpp`. T0 does not
+  hit this (its output and scratch storage are two disjoint spans, each owned by exactly one
+  `TransferSet`), but T1's real-file adapter is more likely to, so re-raising it here rather than letting
+  it resurface as a fresh discovery at T1 time.
