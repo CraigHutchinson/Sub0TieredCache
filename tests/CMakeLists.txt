@@ -26,3 +26,4 @@ sub0tieredcache_add_test(sub0tieredcache-remote-transport-tests remote_transport
 sub0tieredcache_add_test(sub0tieredcache-remote-chunk-store-tests remote_chunk_store_tests.cpp)
 sub0tieredcache_add_test(sub0tieredcache-remote-mirror-tests remote_mirror_tests.cpp)
 sub0tieredcache_add_test(sub0tieredcache-local-file-tests local_file_tests.cpp)
+sub0tieredcache_add_test(sub0tieredcache-remote-e2e-tests remote_e2e_tests.cpp)
