@@ -8,6 +8,7 @@
 
 #include <sub0tieredcache/sub0tieredcache.hpp>
 
+#include <array>
 #include <atomic>
 #include <random>
 #include <thread>
