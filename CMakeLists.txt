@@ -23,6 +23,10 @@ endif()
 # substantial enough that header-only stops being the right packaging (README.md sec 5.2).
 add_library(Sub0TieredCache INTERFACE)
 add_library(Sub0TieredCache::Sub0TieredCache ALIAS Sub0TieredCache)
+if(WIN32)
+    # remote/http_client.hpp (the optional built-in plain-HTTP range client) uses Winsock.
+    target_link_libraries(Sub0TieredCache INTERFACE ws2_32)
+endif()
 
 target_include_directories(Sub0TieredCache INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
