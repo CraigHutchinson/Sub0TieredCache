@@ -1,5 +1,7 @@
 # Reference material
 
+Start with [integration-plan.md](integration-plan.md) for current responsibilities, contracts and standalone test gates.
+
 These files say what was learned about how other people solved this problem and what the constraints
 really are, so [`REQUIREMENTS.md`](../REQUIREMENTS.md) can be argued with on evidence rather than on
 assertion. A conclusion with its own correction attached (see [prior-art.md](prior-art.md)'s "where the

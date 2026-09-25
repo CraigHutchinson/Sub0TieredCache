@@ -1,5 +1,7 @@
 # N-gram / sparse embedding table tiered storage — design + staged plan
 
+Historical motivation and workload analysis. Revision S1 in [integration-plan.md](integration-plan.md) governs current ownership and delivery. Training discussion applies only to frozen imported tables; mutable model parameters remain in Sub0Llm.
+
 **Origin note**: this document originated as [Sub0Llm](https://github.com/CraigHutchinson/Sub0Llm)'s
 own internal design doc (`docs/NGRAM_TABLE_TIERED_STORAGE.md`, still lives there as the historical
 record) while working out how to use a real, huge, released model's n-gram embedding table as a
@@ -287,56 +289,13 @@ network leg, not glossed over.
   today (pure index arithmetic in `forward()`/`forward_one()`), upstream of wherever the resolve step
   gets inserted.
 
-## 5. Staged implementation plan (design only)
+## 5. Staged implementation plan
 
-Each stage names whether it is buildable as **Sub0TieredCache standalone, zero Sub0Llm dependency** or requires
-**Sub0Llm integration**, per the brief's spin-off framing.
-
-- **Stage 0 — Sub0TieredCache: the engine-agnostic interface + an in-memory reference implementation.**
-  `resolve`/`resolve_many`/`prefetch`/`try_get` (exact signatures in `../README.md`) implemented
-  against a plain in-process hash map with no tiering at all — i.e. "the contract, proven with the
-  simplest possible backend." Exit condition: a unit test registers a small synthetic table, resolves a
-  batch of rows, and gets back exactly what was registered — no I/O, no async, no tiers yet. **Buildable
-  standalone.**
-- **Stage 1 — Sub0TieredCache: local-file tiers (RAM cache + local disk mirror), no network.** Implements the
-  RAM working-set cache and a local-disk case-(a)-shaped tier (§2d) against a synthetic or
-  hand-constructed flat table file. Exit condition: a working set that exceeds the RAM budget correctly
-  falls through to the disk tier and returns identical values to Stage 0's reference; a working set that
-  fits the RAM budget never touches disk after warm-up (§2b's headline claim, made checkable against a
-  synthetic corpus of known working-set size). **Buildable standalone.**
-- **Stage 2 — Sub0TieredCache: remote tier (HTTP Range) + disk-tier-as-cache-in-front (case (b)).** Generalizes
-  `docs/QWEN4_PREVIEW_REFERENCE.md`'s proven Stage 1 extraction script (§2d) into the reusable remote leg.
-  Exit condition: resolving the real 96 rows in `tests/fixtures/qwen4_preview/ngram_embedding_*` via live
-  HTTP Range requests against the real Qwen checkpoint reproduces the fixture's `ngram_embedding_per_head.bin`
-  bit-for-bit — the same "real-weight fixture as correctness gate" discipline `docs/GATED_DELTANET.md`
-  §5 step 2 already established, applied to a serving-infra correctness question instead of a math one.
-  **Buildable standalone** (needs network access and the public Hugging Face repo, nothing Sub0Llm-side).
-- **Stage 3 — Sub0Llm integration: thin-client op + resolve-pass wiring.** Sub0Llm vendors the Sub0TieredCache
-  client (`../README.md` §5, "how Sub0Llm consumes it"), and `Model::forward`'s existing n-gram block (§2a) gets an
-  explicit resolve call inserted before its `op_embed`/`op_linear`/`op_add` composition, reading from the
-  resolved buffer instead of a resident tensor — for an EXTERNAL table only; Sub0Llm's own trained table
-  is untouched (§2e). Exit condition: with an external-table build pointed at a small local test table
-  (not the real 102GB one), the composed pipeline's output matches what the SAME table, if it had been a
-  resident `PARAM_LAYOUT` tensor instead, would have produced — i.e. a differential test proving the
-  resolve indirection is transparent to the math, the direct analogue of `docs/NGRAM_EMBEDDING.md` §8's
-  own "neutral-setting" bit-identical checks. **Requires Sub0Llm.**
-- **Stage 4 — Sub0Llm integration: corpus-aware working-set precompute (§2b).** The `ngram_workingset.stamp`
-  mechanism, wired into `sub0llm-configure` next to `tokenizer.stamp`. Exit condition: re-running configure
-  with only an unrelated flag changed hits the stamp and skips recomputation (mirroring
-  `corpus-tok-reuse-stamp`'s own validated re-run timing test); changing `NGRAM_TABLE_SIZE`/`NGRAM_MAX_N`/
-  `NGRAM_TABLES_PER_ORDER` (or, for an external table, its version identifier) correctly invalidates it.
-  **Requires Sub0Llm.**
-- **Stage 5 — Sub0Llm integration: decode-path resolve (§2c).** The one-step-ahead resolve call inserted
-  between token-sample and `forward_one`, using Stage 3's same thin-client contract with a reactive
-  (frequency-leaning) cache policy instead of Stage 4's precomputed one. Exit condition: a generation
-  session against a small local test table produces token-for-token identical output to the same session
-  run with the table fully resident (again, a differential/transparency test, not a new numerical
-  property — the math doesn't change, only where the bytes come from). **Requires Sub0Llm.**
-- **Not scoped by this plan at all**: actually pointing Stage 3/5 at the real 102GB Qwen table end-to-end
-  (a real distillation-teacher-signal use case, not an infra correctness question) — that is downstream
-  of this plan being built, not part of it; a bulk local mirror vs. remain-remote-with-cache decision
-  (§2d/§3) is a user/workflow choice to make once Stage 2 exists, not a design decision this doc needs to
-  pre-commit to.
+Follow [integration-plan.md](integration-plan.md): T0 in-memory contracts, T1 real local transport,
+T2 staged GPU, T3 optional remote persistence, T4 qualified Intel/GDS paths. Each has standalone
+acceptance and a corresponding [Sub0Llm slice](../../Sub0Llm/docs/STORAGE_STACK_PLAN.md).
+Upper-layer fixtures define requirements before lower implementation; lower tested revisions feed
+upward through explicit dependency pins. No engine dependency enters the lower projects.
 
 ## 6. Explicitly deferred (not silently dropped)
 

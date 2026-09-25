@@ -16,10 +16,11 @@ Sub0Llm's own n-gram hash, a MoE router's expert-selection logic, or anything el
 into Sub0TieredCache would tie a generic tiered-cache engine to one caller's domain, defeating the reason it's a
 separate project at all (README §2).
 
-## R2. Only two calls may block on I/O
+## R2. Only resolve and wait may block on I/O during steady-state use
 
 "`resolve_into` and `wait` are the only calls in the API that may block on I/O. `try_get` must never
-block. No other call implicitly triggers a synchronous fetch."
+block. No other steady-state call implicitly triggers a synchronous fetch. Registration and explicit
+shutdown/drain are administrative and may block; lease release may not hide a drain."
 
 This is the load-bearing requirement the whole design exists to satisfy: a caller with its own
 no-heap-allocation or bounded-latency hot-path rule (Sub0Llm's `AGENTS.md` §1 is the motivating real
@@ -33,42 +34,34 @@ loop than the rest of the API is built around.
 `resolve_into`, and thereafter read that buffer with zero further calls into Sub0TieredCache."
 
 This is the shape a no-heap-allocation, no-branch-on-miss hot path actually needs — resolve everything
-first, compute unconditionally after. `docs/reference-consumer-sub0llm.md` §1 traces this against
-Sub0Llm's real `forward()` call site to confirm the shape actually fits a real caller, not just a
-hypothetical one.
+first, compute after successful completion. The [consumer audit](docs/reference-consumer-sub0llm.md)
+distinguishes proposed frozen-table integration from current mutable model parameters.
 
-## R4. A row's VALUE is immutable between registration and an explicit `invalidate`
+## R4. Row values belong to immutable source generations
 
-"A row resolved into any tier is guaranteed correct as of the table's current `version_tag` until that
-table's next `invalidate` call. There is no TTL-based expiry and no background staleness."
-
-Deliberately scoped to a row's *value*, not to the table's addressable *size* — see "Deferred: a
-table's addressable row range MAY grow" below for why that distinction is load-bearing, not pedantic.
-The tables Sub0TieredCache serves are either genuinely frozen (an imported checkpoint) or updated only at
-well-defined bulk boundaries a caller signals explicitly (R1's non-goal already rules out per-row writes)
-— a silent expiry policy would be solving a write-concurrency problem that doesn't exist here, at the
-cost of real unpredictability for the read-only case that's the entire point.
+A request captures the current generation. Invalidation publishes a new immutable source generation for
+new requests; old leases remain valid for their captured generation until released. Old completions
+cannot publish into the new generation. Old source handles and memory drain before destruction. A
+version tag does not make concurrent mutation of a source file safe; provide a snapshot or quiesce writers.
+If two live generations exceed the budget, report busy/exhaustion rather than silently overcommit.
 
 ## R5. Concurrent requests for the same row coalesce into one fetch
 
-"Multiple threads calling `prefetch`/`resolve_into` concurrently for the same row must trigger exactly
-one real fetch, not one per caller."
+"Multiple threads calling `prefetch`/`resolve_into` concurrently for the same row must trigger one live fetch/conversion per
+source-generation, row, representation and destination domain. Requests after eviction may fetch again;
+distinct device destinations are not the same cache key."
 
-Sub0Llm's real training path runs up to ~24 concurrent OMP worker threads (`docs/reference-consumer-sub0llm.md`
-§1), each processing an independent window that shares real vocabulary with its neighbors — duplicate
-concurrent fetches for the same hot row are a real, expected occurrence at that concurrency level, not an
-edge case worth deprioritizing.
+Concurrent frozen-table consumers can request repeated row IDs; standalone tests exercise this
+without assuming a particular engine thread count or migrating mutable training parameters.
 
-## R6. Dtype conversion is Sub0TieredCache's job, performed once
+## R6. The cache owns representation conversion scheduling and reuse
 
-"A caller receives rows already converted to the dtype it registered the table with. Sub0TieredCache performs
-any on-disk-to-requested-dtype conversion itself, cached converted rather than reconverted on every warm
-hit, never pushed back onto the caller as a second pass."
-
-The motivating real table (`Qwen/Qwen3.8-Flash-Next`'s n-gram embeddings) is stored `bf16` on disk; the
-motivating real caller computes in `float32`. Leaving conversion to the caller would mean every consumer
-re-implements the same dequantization logic, which is exactly the kind of thing a shared library exists
-to not duplicate.
+Registration declares source and output widths, dtype/encoding, layout, device/domain and any codec.
+A successful resolve returns the requested representation; warm hits do not reconvert. Unsupported
+conversion fails explicitly. Generic scalar codecs may be built in; model-specific quantization/layout
+kernels are supplied by the consumer, never implemented by the format-agnostic core. Identity/native-
+encoded rows are supported so a quantized consumer is not forced through float32. Input/output buffers
+are distinct and live through codec completion. The cache owns publication and reuse, not model math.
 
 ## R7. Format-agnostic core; no embedded knowledge of any specific external file format
 
@@ -82,9 +75,11 @@ in Sub0Llm — this callback contract, not a shared parser, is the reuse boundar
 
 ## R8. Identical public semantics on Linux, macOS, and Windows from the first implementation
 
-"No public API behavior differs by platform. A platform-specific default (a cache directory path,
-`mmap` vs. `MapViewOfFile`) is an internal implementation detail behind a uniform contract, never a
-documented behavioral difference a caller has to branch on."
+"The baseline host API has identical semantics on Linux, macOS and Windows. Optional accelerator
+backends expose capabilities and explicit unsupported results; NVIDIA GDS need not exist on every OS.
+A platform-specific default (a cache directory path,
+`mmap` vs. `MapViewOfFile`) is an internal implementation detail behind a uniform contract, without weakening the baseline correctness contract. Choosing a supported accelerator
+path is explicit; a compatible fallback must preserve output/lifetime semantics and report its path."
 
 Sub0Llm itself is Windows-first today; Sub0TieredCache deliberately is not — the entire reason it's worth
 existing as a separate project is that huge sparse lookup tables are a generic problem (README §2), and a
@@ -109,6 +104,34 @@ Without this, "is the cache actually working" becomes a guess. Matches the same 
 own "a drop is never silent" requirement (a sibling project's real, already-written requirement,
 independently arriving at the same principle: a mechanism whose own effectiveness can't be observed
 can't be trusted or tuned).
+
+## R11. Zero-copy access returns an owning lease
+
+`try_get` returns an optional move-only RowLease, never an unowned row_view. Its storage remains valid
+until release, including asynchronous compute. It performs no I/O/conversion and reports miss/contention
+promptly. A prefetch ticket or successful wait is not a row pin. Device rows expose domain-aware handles,
+not CPU spans; reuse waits for the last consumer event without blocking ordinary release.
+
+## R12. Memory, request and scratch budgets are explicit
+
+Registration fixes per-tier capacity, pinned staging, conversion/gather scratch and request/event limits.
+No steady-state request allocates fresh bulk storage or silently expands a pool. Exhaustion is reported;
+batch-too-large cannot deadlock on its own pins. Deployment planning counts lower raw pools, output
+representations and driver headroom separately. Hard managed limits do not imply a total-RSS bound.
+
+## R13. Local byte transport is delegated to Sub0MemPage
+
+The cache supplies extents and reserved storage to a pinned Sub0MemPage dependency; it does not fork an
+OS/CUDA/cuFile/SYCL transfer engine. Row policy has one owner. Raw-cache eviction cannot invalidate a
+published row without its backing lease protecting it. Remote HTTP and versioned mirror publication
+remain in this project; the lower layer sees immutable local sources. Standalone tests never require Llm.
+
+## R14. Failures and publication are explicit
+
+No partial read/conversion is published as a complete row; stale completions cannot corrupt a new
+version. Batched output preserves order/duplicates. The initial batch contract publishes all-or-nothing
+success; callers must not read failed output even if some writes occurred. Cancellation/timeout retains
+claims until writers drain. No implicit zero-row substitution, retry into live output or hidden fallback.
 
 ## Deferred: a table's addressable row range MAY grow (named now, not required for v1)
 

@@ -1,11 +1,13 @@
 # Sub0TieredCache — a tiered cache for huge frozen sparse-lookup tables
 
+The [integration plan](docs/integration-plan.md) owns the current delivery sequence and the MemPage boundary. Historical design discussion below supplies motivation, not additional shipped capabilities.
+
 Status: **SPEC / REQUIREMENTS DRAFT.** No implementation exists yet, in either Sub0Llm or this repo —
 `include/sub0tieredcache/sub0tieredcache.hpp` is a skeleton. This document is the pitch and the concrete API surface;
 [REQUIREMENTS.md](REQUIREMENTS.md) is the normative contract an implementation is checked against.
 
 **Documentation map**:
-- [REQUIREMENTS.md](REQUIREMENTS.md) — the normative contract (R1–R10), each a testable sentence.
+- [REQUIREMENTS.md](REQUIREMENTS.md) — the normative contract (R1–R14), each a testable sentence.
 - [AGENTS.md](AGENTS.md) — pre-flight checklist for anyone (human or agent) implementing against this spec.
 - [STYLE_GUIDE.md](STYLE_GUIDE.md) — naming and code-style conventions.
 - [docs/](docs/) — reference material: [tiered-storage-design.md](docs/tiered-storage-design.md) (the
@@ -108,112 +110,39 @@ project rather than keeping it Sub0Llm-internal:
   (edge devices, personal workstations, anywhere the "63GB RAM, 8GB VRAM" constraint that motivated this
   project generalizes to "less RAM than the data").
 
-## 3. API surface
+## 3. Proposed interface and ownership
 
-Given as an engine-agnostic contract, not C++ syntax — an implementation should render this faithfully
-into whatever binding surface it exposes (a C++ header-only client is the first target, per §5, but the
-contract itself is language-neutral so a Python/Rust binding later is a faithful port, not a redesign).
+The [integration plan](docs/integration-plan.md) defines revision S1. These are conceptual
+operations, not frozen C++ declarations or implemented capabilities.
 
-```
-register_table(table_id, row_width_bytes, row_dtype, source_descriptor, version_tag) -> table_handle
-    // Registers a table this process will read from. `source_descriptor` names where the table's rows
-    // physically live (see below); Sub0TieredCache does not eagerly read anything at registration time beyond
-    // whatever metadata the source needs (e.g. a safetensors shard index).
-    // `version_tag` is an opaque caller-supplied identifier (a content hash, a checkpoint step number)
-    // used only for staleness detection (see "Consistency" below) — Sub0TieredCache never interprets it.
+- Registration supplies immutable source identity/generation, row count, encoded row width and
+  layout, output representation/domain, bounded budgets and an optional caller codec. Flat-file
+  offsets use the encoded width; shard resolvers supply checked byte ranges. GPU contexts are explicit.
+- `prefetch` submits bounded work and returns a completion ticket. `wait` observes completion only;
+  it does not pin a row or guarantee a later cache hit.
+- `try_get` returns an optional move-only `RowLease`, never an unowned row view. It does not wait
+  for I/O or locks. A lease protects its generation and representation until released; GPU consumers
+  keep it through their final event using bounded retirement storage.
+- `resolve_into` uses a caller-owned destination claim and explicit completion. Failed or short fills
+  never publish usable rows. Destination memory survives every outstanding writer and consumer.
+- `stats` reports bounded resource use, row hits and actual transport/fallback routes.
+- `invalidate` is an administrative generation transition. New requests bind to a new immutable snapshot; old leases retain their generation. Drain old
+  writers and leases before retiring or reusing old source/storage. Reject a transition that exceeds budgets.
 
-prefetch(table_handle, row_indices[]) -> prefetch_ticket
-    // Asynchronous. Kicks off resolution of the named rows into the fast tiers, in the background.
-    // Returns immediately. Never blocks the caller's thread.
+### 3a. Consistency
 
-wait(prefetch_ticket)
-    // Blocks the calling thread until every row named by that ticket's prefetch() call is resolved
-    // into a tier at least as fast as the RAM working-set tier. This is the caller's explicit
-    // "resolve pass" barrier — the ONLY place in this contract a caller should expect to block on I/O.
+Sources are immutable throughout a live generation. Disk entries include source identity, generation
+and representation; publication is atomic. No TTL, file mtime or advisory callback substitutes for
+identity. A concurrent reader cannot observe a partially written row or silently cross generations.
+Remote acquisition and persistent publication belong here; local byte movement uses Sub0MemPage.
 
-resolve_into(table_handle, row_indices[], dest_buffer)
-    // Synchronous. Caller supplies a pre-sized destination buffer (row_indices.size() * row_width_bytes)
-    // and gets every named row copied into it, in the given order, blocking until done. The direct
-    // building block for a caller's own "resolve pass before the hot loop" (see
-    // docs/tiered-storage-design.md §2a) — call this once, up front, then read dest_buffer from the
-    // hot path with zero further calls into Sub0TieredCache.
+### 3b. Concurrency
 
-try_get(table_handle, row_index) -> optional<row_view>
-    // Zero-copy. Returns a view directly into an already-resident tier's backing memory if this row
-    // happens to already be resolved there, or nothing if not (never blocks, never triggers I/O).
-    // For callers that can tolerate an occasional fall-through to resolve_into rather than needing a
-    // hard guarantee ahead of time.
-
-stats(table_handle) -> { per-tier hit counts, per-tier resident row counts, bytes resident per tier }
-    // Observability only. No behavior depends on reading this.
-
-invalidate(table_handle, new_version_tag)
-    // Administrative. Marks every currently-cached row for this table as stale (see "Consistency"
-    // below) and updates the table's version tag. Does not itself evict anything eagerly — subsequent
-    // resolve_into/prefetch calls re-fetch from source on next need. This is the bulk-update path
-    // (§1b's "defined update boundaries"), not a per-row write API — there is no per-row write API.
-```
-
-**`source_descriptor` variants** (v1: one table registration names exactly one source — a single flat
-local file, a local shard set + offset-resolution callback, or a remote HTTP(S) Range source + local
-disk cache directory. `REQUIREMENTS.md`'s DR1 names, but defers past v1, a `base`+`overlay` layered form
-of this — a frozen remote/local base source shadowed by a small, genuinely-writable local overlay for
-incrementally-added rows; not implemented yet, but `register_table`'s signature should stay free to grow
-a second, optional overlay-source parameter without a wire-format break):
-
-- `local_flat_file(path)` — one file, rows at `row_index * row_width_bytes`, `mmap`'d.
-- `local_sharded(shard_paths[], offset_resolver_callback)` — a caller-supplied callback maps
-  `row_index -> (shard_index, byte_offset)`, so Sub0TieredCache never needs to understand any particular
-  external file format (safetensors, GGUF, or anything else) — that translation is the caller's
-  responsibility, matching `docs/tiered-storage-design.md` §2d's point that this generalizes `gguf.hpp`'s
-  existing offset-computation logic rather than duplicating it inside Sub0TieredCache.
-- `remote_http_range(base_url, offset_resolver_callback, local_disk_cache_dir)` — same offset-resolution
-  shape, but reads go over HTTP Range requests, with `local_disk_cache_dir` as the persistent disk tier
-  in front of the network (`docs/tiered-storage-design.md` §2d's case (b)).
-
-### 3a. Consistency / staleness guarantees
-
-Rows are **immutable between registration and an explicit `invalidate` call.** Sub0TieredCache assumes a table
-is either genuinely frozen (an imported external checkpoint — the common case) or updated only at
-well-defined bulk boundaries the caller signals explicitly (a training checkpoint step) — never mutated
-row-by-row while cached copies might be in flight. Concretely:
-
-- Within one process, a row resolved into any tier is guaranteed correct as of the table's current
-  `version_tag` until that table's next `invalidate` call — no background staleness, no TTL-based
-  silent expiry.
-- Across processes sharing a **disk-tier** cache (§5's "system/user-level cache" case): the disk format
-  must itself carry the `version_tag` per cached entry (or per cache generation), so a second process
-  opening the same cache directory can detect and skip entries written under a stale version rather than
-  trusting file mtimes alone. The exact mechanism is an implementation decision for the chosen disk-tier
-  backend (`docs/prior-art.md`'s LMDB-leaning discussion), not fixed by this spec, but
-  the guarantee itself (a reader can always tell a stale entry from a fresh one) is a hard requirement.
-- Sub0TieredCache makes **no promise about visibility across processes for a row resolved via `prefetch`/
-  `resolve_into` but not yet flushed to a persistent tier** — that is purely an in-process, in-memory
-  optimization from Sub0TieredCache's point of view. Cross-process sharing exists only at the disk-tier
-  boundary, following whatever consistency model the disk backend itself provides (an MVCC-style
-  embedded store gives "readers see the last-committed generation" for free, which is the recommended
-  shape — `docs/prior-art.md`).
-
-### 3b. Concurrency model
-
-- **Single writer per table, many concurrent lock-free-or-cheaply-locked readers.** This is not a
-  simplification made for convenience — §1b already establishes that Sub0TieredCache's tables are never
-  genuinely multi-writer, so the concurrency model should be built around that fact rather than solving
-  a harder problem nothing in scope needs.
-  - Cache tier population (a `prefetch`/`resolve_into` call filling the RAM or disk tier) is the "write"
-    from Sub0TieredCache's own internal point of view, even though the caller only ever sees it as a read API —
-    multiple threads calling `prefetch`/`resolve_into` concurrently for *different* rows must be safe and
-    should scale; concurrent calls that happen to name the *same* row should coalesce into one real
-    fetch, not duplicate the I/O.
-  - `invalidate` (§3, an actual administrative write to the table's identity) is expected to be rare and
-    may take a coarser lock — it is explicitly not a hot-path operation.
-- **`try_get` must never block.** It either returns a resident row immediately or returns nothing —
-  this is the one call in the contract a caller may safely place anywhere, including inside a tighter
-  loop than the "resolve pass" the rest of the API is built around, precisely because it can never
-  introduce the unbounded-latency branch `docs/tiered-storage-design.md` §2a's host engine cannot
-  tolerate.
-- **`wait` blocks only the calling thread**, never a global lock — other threads' independent
-  `prefetch`/`resolve_into`/`try_get` calls must proceed unaffected.
+Coalesce requests only within the same generation, representation and device/context. Admission and
+result storage are bounded and preallocated. Batch acquisition pins all requested results or none;
+requests too large for the configured capacity fail before waiting. Blocking resolve/wait never hold
+state locks while awaiting I/O. Administrative registration/drain may block. Portable host behavior
+is the baseline; optional GPU backends explicitly report unsupported configurations.
 
 ## 4. What Sub0TieredCache stands on — prior art, as this project's own bootstrapping reference
 
