@@ -55,22 +55,20 @@ target_compile_features(Sub0TieredCache INTERFACE cxx_std_23)
 set(SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION "213acdd2121cec369c6b9606c514db2231e94f27"
     CACHE STRING "Pinned Sub0MemPage commit (docs/integration-plan.md acceptance order).")
 
-if(NOT IS_SUBPROJECT)
+# Consumers may supply the dependency themselves; otherwise resolve the same pinned dependency
+# in standalone and subproject builds. The public target always carries its usage requirements.
+if(NOT TARGET Sub0MemPage::Sub0MemPage)
     include(FetchContent)
-    # Sub0MemPage's own tests/bench/tools must not build as part of Sub0TieredCache's build -- set its
-    # options OFF before MakeAvailable (its CMakeLists.txt option names: SUB0MEMPAGE_BUILD_TESTING,
-    # SUB0MEMPAGE_BUILD_EXAMPLES; see docs/integration-plan.md's "Contract feedback" section for why
-    # there is no single "don't build tools" switch to flip instead).
-    set(SUB0MEMPAGE_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-    set(SUB0MEMPAGE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SUB0MEMPAGE_BUILD_TESTING OFF CACHE BOOL "Build Sub0MemPage unit-tests")
+    set(SUB0MEMPAGE_BUILD_EXAMPLES OFF CACHE BOOL "Build Sub0MemPage examples")
     FetchContent_Declare(
         Sub0MemPage
         GIT_REPOSITORY https://github.com/CraigHutchinson/Sub0MemPage.git
         GIT_TAG ${SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION}
     )
     FetchContent_MakeAvailable(Sub0MemPage)
-    target_link_libraries(Sub0TieredCache INTERFACE Sub0MemPage::Sub0MemPage)
 endif()
+target_link_libraries(Sub0TieredCache INTERFACE Sub0MemPage::Sub0MemPage)
 
 if(SUB0TIEREDCACHE_BUILD_TESTING AND NOT IS_SUBPROJECT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)

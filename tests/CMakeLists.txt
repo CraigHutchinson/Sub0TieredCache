@@ -27,3 +27,20 @@ sub0tieredcache_add_test(sub0tieredcache-remote-chunk-store-tests remote_chunk_s
 sub0tieredcache_add_test(sub0tieredcache-remote-mirror-tests remote_mirror_tests.cpp)
 sub0tieredcache_add_test(sub0tieredcache-local-file-tests local_file_tests.cpp)
 sub0tieredcache_add_test(sub0tieredcache-remote-e2e-tests remote_e2e_tests.cpp)
+
+# Compile a parent that links only our public target, both with a supplied dependency and with
+# our pinned FetchContent resolution. Both paths are offline and use the already-resolved sources.
+get_target_property(_mempage_source Sub0MemPage SOURCE_DIR)
+foreach(_provided IN ITEMS ON OFF)
+    add_test(NAME sub0tieredcache.consumer-${_provided}
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE=${PROJECT_SOURCE_DIR}"
+            "-DBINARY=${CMAKE_CURRENT_BINARY_DIR}/consumer-${_provided}"
+            "-DMEMPAGE=${_mempage_source}"
+            "-DGENERATOR=${CMAKE_GENERATOR}"
+            "-DCOMPILER=${CMAKE_CXX_COMPILER}"
+            "-DCONFIG=$<CONFIG>"
+            "-DPROVIDE=${_provided}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_consumer.cmake")
+    set_tests_properties(sub0tieredcache.consumer-${_provided} PROPERTIES TIMEOUT 120)
+endforeach()

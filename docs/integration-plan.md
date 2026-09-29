@@ -177,3 +177,6 @@ on a byte-only MoE consumer. Its invalidation uses retiring/current transfer bin
 storage with exclusive per-range claims; future R18 enforcement must preserve that legitimate pattern.
 Native I/O tuning, Intel/GDS qualification and GPU row caches are separate subsequent packages.
 This refresh ran no builds or hardware measurements; CI and historical local results remain distinct.
+
+S1b packaging follow-up: [2026-09-29 validation](validation/2026-09-29/README.md) records
+the parent-consumer fixes and complete Windows/Linux suites. Runtime transport pins remain unchanged.
