@@ -64,7 +64,8 @@ public:
 
     /** Discovers the row-length classes, splits the storage and creates one Table per class.
      *  @return invalid_argument for an empty table, storage too small to give every class two batches
-     *          of rows, or more than max_classes distinct lengths; otherwise as Table::create.
+     *          of rows (or all of its rows, if fewer), or more than max_classes distinct lengths;
+     *          otherwise as Table::create.
      */
     [[nodiscard]] static std::expected<std::unique_ptr<SizeClassedTable>, Status>
     create(const SizeClassedTableConfig& config, sub0mempage::FillBackendRef backend);
@@ -165,7 +166,9 @@ SizeClassedTable::create(const SizeClassedTableConfig& config, sub0mempage::Fill
         const double share = static_cast<double>(cls.rows) * static_cast<double>(cls.width) / total_bytes;
         const auto bytes = static_cast<std::uint64_t>(share * static_cast<double>(config.output_storage.size()));
         const std::uint64_t rows = std::min<std::uint64_t>(bytes / cls.width, cls.rows);
-        if (rows < 2ull * config.max_batch_rows || rows >= UINT32_MAX) return std::unexpected(Status::invalid_argument);
+        // Two batches of rows, so one batch can stay leased while the next fills -- or the whole class.
+        if (rows < std::min<std::uint64_t>(2ull * config.max_batch_rows, cls.rows) || rows >= UINT32_MAX)
+            return std::unexpected(Status::invalid_argument);
         cls.budget_rows = static_cast<std::uint32_t>(rows);
         used += rows * cls.width;
     }

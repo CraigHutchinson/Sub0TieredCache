@@ -118,6 +118,11 @@ void test_registration_refusals() {
     cfg.max_classes = 2;
     check(SizeClassedTable::create(cfg, FillBackendRef(backend)).error() == Status::invalid_argument,
           "more distinct widths than max_classes is refused");
+    // Row 5 alone is 16 bytes wide: a one-row class, held whole, is not refused for lacking two batches.
+    std::vector<std::byte> whole(512);
+    auto table = SizeClassedTable::create(config(whole, sources, RowExtentResolverRef(three)), FillBackendRef(backend));
+    check(table.has_value() && (*table)->classes().size() == 3 && (*table)->classes()[2].budget_rows == 1,
+          "a class smaller than two batches is accepted when it is held whole");
     TwoWidthResolver two;
     std::vector<std::byte> tiny(40);
     check(SizeClassedTable::create(config(tiny, sources, RowExtentResolverRef(two)), FillBackendRef(backend)).error() ==
