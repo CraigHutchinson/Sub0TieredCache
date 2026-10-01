@@ -290,6 +290,10 @@ struct TableConfig {
     std::uint64_t row_count = 0;              ///< Addressable row_index range is [0, row_count).
     std::uint64_t source_row_bytes = 0;       ///< Encoded row width (exact), or the maximum (bounded).
     RowExtent row_extent = RowExtent::exact;  ///< Whether resolved rows may be shorter than source_row_bytes.
+    /// Identity only: split each row's fill into reads of at most this many bytes, all submitted at once,
+    /// so idle backend workers share one row and a miss lands sooner. 0 = one read per row. The backend's
+    /// queue must hold max_batch_rows * ceil(source_row_bytes / fill_chunk_bytes) requests.
+    std::uint64_t fill_chunk_bytes = 0;
     std::uint64_t output_row_bytes = 0;       ///< Published row width (== source_row_bytes iff identity).
     Representation representation = Representation::identity;
     Codec* codec = nullptr;                   ///< Required iff representation == custom; unused otherwise.
@@ -450,6 +454,8 @@ private:
         Binding* fill_binding = nullptr; ///< Non-owning; which binding's in_flight counter to release.
         std::optional<sub0mempage::Claim> claim; ///< Live only while state == filling.
         std::uint32_t scratch_slot = NONE;       ///< Valid only while converting and state == filling.
+        std::vector<sub0mempage::Claim> chunk_claims; ///< Sized at construction iff fill_chunk_bytes splits rows.
+        std::uint32_t chunk_count = 0;           ///< chunk_claims in use for the current fill (0 = `claim`).
         std::uint64_t published_bytes = 0;       ///< Lease length once Ready: output_row_bytes unless bounded.
     };
 
@@ -529,6 +535,7 @@ private:
     sub0mempage::FillBackendRef backend_;
     Bf16ToF32Codec builtin_bf16_codec_;
     Codec* active_codec_ = nullptr; // nullptr iff identity (no codec step)
+    std::uint32_t chunks_per_row_ = 1; ///< ceil(source_row_bytes / fill_chunk_bytes), or 1
 
     std::unique_ptr<Binding> current_binding_;
     std::unique_ptr<Binding> retiring_binding_; // null iff no superseded binding is still draining
@@ -675,6 +682,9 @@ inline std::expected<std::unique_ptr<Table>, Status> Table::create(const TableCo
     if (config.row_extent == RowExtent::bounded && config.representation != Representation::identity) {
         return std::unexpected(Status::unsupported_conversion); // see RowExtent::bounded
     }
+    if (config.fill_chunk_bytes != 0 && config.representation != Representation::identity) {
+        return std::unexpected(Status::unsupported_conversion); // see TableConfig::fill_chunk_bytes
+    }
     if (config.representation != Representation::identity) {
         if (config.scratch_rows == 0 ||
             config.source_row_bytes > SIZE_MAX / config.scratch_rows ||
@@ -715,7 +725,7 @@ inline std::unique_ptr<Table::Binding> Table::make_binding(std::span<const Shard
     for (const ShardSource& shard : sources) {
         auto row_transfer = sub0mempage::TransferSet::create(
             {.source = shard.source, .source_bytes = shard.bytes, .destination = config_.output_storage,
-             .max_claims = config_.budget_rows},
+             .max_claims = config_.budget_rows * chunks_per_row_},
             backend_);
         if (!row_transfer) {
             error = detail::from_mempage(row_transfer.error());
@@ -748,6 +758,11 @@ inline Table::Table(Passkey, const TableConfig& config, sub0mempage::FillBackend
       current_generation_(config.generation),
       scratch_used_(config.scratch_rows, false) {
     index_shift_ = 64 - std::countr_zero(index_.size());
+    if (config_.fill_chunk_bytes != 0 && config_.fill_chunk_bytes < config_.source_row_bytes) {
+        chunks_per_row_ = static_cast<std::uint32_t>((config_.source_row_bytes + config_.fill_chunk_bytes - 1) /
+                                                     config_.fill_chunk_bytes);
+        for (Slot& slot : slots_) slot.chunk_claims.resize(chunks_per_row_); // administrative: may allocate
+    }
 
     active_codec_ = config_.representation == Representation::identity   ? nullptr
                    : config_.representation == Representation::bf16_to_f32 ? &builtin_bf16_codec_
@@ -894,6 +909,8 @@ inline void Table::make_free(std::uint32_t slot) noexcept {
     s.state = SlotState::free;
     s.referenced = false;
     s.claim.reset();
+    for (std::uint32_t c = 0; c < s.chunk_count; ++c) s.chunk_claims[c].reset();
+    s.chunk_count = 0;
     s.scratch_slot = NONE;
     s.fill_binding = nullptr;
 }
@@ -942,7 +959,22 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
         return fail(Status::out_of_range);
     }
 
-    if (active_codec_ == nullptr) {
+    if (active_codec_ == nullptr && chunks_per_row_ > 1) {
+        // One read per chunk, all submitted now, so several backend workers fill this row at once. A
+        // partial submission's accepted chunks are released as dropped-in-flight: MemPage refuses any
+        // overlapping reuse of their destination until they finish, so no later fill can race them.
+        const std::uint64_t base = std::uint64_t{slot} * config_.output_row_bytes;
+        for (std::uint64_t at = 0; at < location->range.length; at += config_.fill_chunk_bytes) {
+            const std::uint64_t length = std::min(config_.fill_chunk_bytes, location->range.length - at);
+            auto claim = current_binding_->row_transfers[shard]->submit({location->range.offset + at, length}, base + at);
+            if (!claim) {
+                for (std::uint32_t c = 0; c < s.chunk_count; ++c) s.chunk_claims[c].reset();
+                s.chunk_count = 0;
+                return fail(detail::from_mempage(claim.error()));
+            }
+            s.chunk_claims[s.chunk_count++] = std::move(*claim);
+        }
+    } else if (active_codec_ == nullptr) {
         auto claim = current_binding_->row_transfers[shard]->submit(location->range, std::uint64_t{slot} * config_.output_row_bytes);
         if (!claim) {
             return fail(detail::from_mempage(claim.error()));
@@ -978,12 +1010,20 @@ inline void Table::finish_fill(std::uint32_t slot, Deadline deadline) noexcept {
     if (s.state != SlotState::filling) {
         return; // already finished by someone else, or evicted (should not happen while filling)
     }
-    sub0mempage::Claim* claim = &*s.claim; // stable address; only the finisher (this thread) touches it
+    const std::uint32_t chunks = s.chunk_count;
+    sub0mempage::Claim* claim = chunks ? nullptr : &*s.claim; // stable; only the finisher touches it
     const bool converting = active_codec_ != nullptr;
     const std::uint32_t scratch = s.scratch_slot;
     lock.unlock();
 
-    const sub0mempage::Status raw_status = claim->wait(deadline);
+    sub0mempage::Status raw_status = sub0mempage::Status::ok;
+    if (chunks != 0) {
+        // Every chunk must land before the row is published; the first failure (or a timeout) decides.
+        for (std::uint32_t c = 0; c < chunks && raw_status == sub0mempage::Status::ok; ++c)
+            raw_status = s.chunk_claims[c].wait(deadline);
+    } else {
+        raw_status = claim->wait(deadline);
+    }
     if (raw_status == sub0mempage::Status::timeout) {
         // The transfer and its claim/reservation are still live (transfer-contract.md: "timeout leaves
         // the transfer live"). Relinquish finishing so a later wait()/resolve_into call, or the
@@ -1004,6 +1044,8 @@ inline void Table::finish_fill(std::uint32_t slot, Deadline deadline) noexcept {
 
     lock.lock();
     s.claim.reset(); // releases the identity or scratch reservation now that we are done reading it
+    for (std::uint32_t c = 0; c < s.chunk_count; ++c) s.chunk_claims[c].reset();
+    s.chunk_count = 0;
     if (converting) {
         release_scratch(scratch);
         s.scratch_slot = NONE;

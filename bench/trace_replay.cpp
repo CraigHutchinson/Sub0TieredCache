@@ -39,6 +39,7 @@ struct Options {
     std::uint64_t budget_mib = 1024;
     std::uint32_t readers = 8;
     double compute_us = 0;          // synthetic compute per batch, after its rows are resident
+    std::uint64_t chunk_kib = 0;     // TableConfig::fill_chunk_bytes in KiB (0 = one read per row)
     std::uint64_t limit_batches = 0; // 0 = whole trace
 };
 
@@ -131,11 +132,12 @@ Options parse(int argc, char** argv) {
         else if (a == "--readers") o.readers = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--compute-us") o.compute_us = std::stod(next());
         else if (a == "--limit-batches") o.limit_batches = std::stoull(next());
+        else if (a == "--chunk-kib") o.chunk_kib = std::stoull(next());
         else fail("unknown argument " + std::string(a));
     }
     if (o.data.empty() || o.extents.empty() || o.trace.empty())
         fail("usage: --data FILE --extents FILE --trace FILE [--budget-mib N] [--readers N] [--compute-us X] "
-             "[--limit-batches N]");
+             "[--limit-batches N] [--chunk-kib N]");
     return o;
 }
 
@@ -157,8 +159,11 @@ int main(int argc, char** argv) {
     std::error_code ec;
     const auto file_bytes = std::filesystem::file_size(o.data, ec);
     if (ec) fail("cannot stat " + o.data);
+    const std::uint64_t chunk_bytes = o.chunk_kib << 10;
+    const auto chunks_per_row = static_cast<std::uint32_t>(
+        chunk_bytes && chunk_bytes < row_bytes ? (row_bytes + chunk_bytes - 1) / chunk_bytes : 1);
     auto backend = sub0mempage::LocalFileBackend::create(
-        {.workers = o.readers, .queue_capacity = 4 * max_batch, .max_sources = 1});
+        {.workers = o.readers, .queue_capacity = 4 * max_batch * chunks_per_row, .max_sources = 1});
     if (!backend) fail("backend create failed");
     constexpr auto kSource = static_cast<sub0mempage::SourceId>(1);
     if ((*backend)->register_file(kSource, o.data) != sub0mempage::Status::ok) fail("cannot register " + o.data);
@@ -178,6 +183,7 @@ int main(int argc, char** argv) {
     cfg.budget_rows = static_cast<std::uint32_t>(budget_rows);
     cfg.max_tickets = 4;
     cfg.max_batch_rows = max_batch;
+    cfg.fill_chunk_bytes = chunk_bytes;
     auto table = Table::create(cfg, sub0mempage::FillBackendRef(**backend));
     if (!table) fail("table create failed");
 
@@ -186,14 +192,16 @@ int main(int argc, char** argv) {
     std::vector<double> waits_us;
     waits_us.reserve(trace.rows.size());
     std::uint64_t accesses = 0, misses = 0, miss_bytes = 0;
-    double stall_us = 0;
+    double stall_us = 0, prefetch_us = 0;
     const auto compute = std::chrono::duration<double, std::micro>(o.compute_us);
 
     const auto t0 = Clock::now();
     for (std::size_t b = 0; b < batches; ++b) {
         const std::span<const std::uint64_t> rows(trace.rows.data() + trace.starts[b], trace.starts[b + 1] - trace.starts[b]);
         for (auto& lease : leases) lease.reset();
+        const auto issued = Clock::now();
         (void)(*table)->prefetch(rows); // a hint: per-row admission failures surface in resolve_into below
+        prefetch_us += std::chrono::duration<double, std::micro>(Clock::now() - issued).count();
         for (std::size_t i = 0; i < rows.size(); ++i) {
             ++accesses;
             if (auto hit = (*table)->try_get(rows[i])) {
@@ -221,23 +229,24 @@ int main(int argc, char** argv) {
     std::sort(waits_us.begin(), waits_us.end());
     const auto stats = (*table)->stats();
     const double hit_rate = accesses ? 1.0 - static_cast<double>(misses) / static_cast<double>(accesses) : 0;
-    std::printf("trace-replay: %zu batches, %llu accesses, budget %llu rows (%.1f GiB), %u readers, compute %.0f us/batch\n",
+    std::printf("trace-replay: %zu batches, %llu accesses, budget %llu rows (%.1f GiB), %u readers, compute %.0f us/batch, chunk %llu KiB\n",
                 batches, static_cast<unsigned long long>(accesses), static_cast<unsigned long long>(budget_rows),
-                static_cast<double>(budget_rows * row_bytes) / (1ull << 30), o.readers, o.compute_us);
+                static_cast<double>(budget_rows * row_bytes) / (1ull << 30), o.readers, o.compute_us,
+                static_cast<unsigned long long>(o.chunk_kib));
     std::printf("  hit rate %.2f%% | misses %llu (%.2f GiB read) | fetches %llu, evictions %llu\n", 100 * hit_rate,
                 static_cast<unsigned long long>(misses), static_cast<double>(miss_bytes) / (1ull << 30),
                 static_cast<unsigned long long>(stats.fetches), static_cast<unsigned long long>(stats.evictions));
-    std::printf("  miss wait us: p50 %.0f  p90 %.0f  p99 %.0f  max %.0f | total stall %.2f s of %.2f s wall\n",
+    std::printf("  miss wait us: p50 %.0f  p90 %.0f  p99 %.0f  max %.0f | total stall %.2f s, prefetch %.2f s, of %.2f s wall\n",
                 percentile(waits_us, 0.5), percentile(waits_us, 0.9), percentile(waits_us, 0.99),
-                waits_us.empty() ? 0.0 : waits_us.back(), stall_us / 1e6, wall_s);
-    std::printf("{\"batches\":%zu,\"accesses\":%llu,\"budget_rows\":%llu,\"readers\":%u,\"compute_us\":%.1f,"
+                waits_us.empty() ? 0.0 : waits_us.back(), stall_us / 1e6, prefetch_us / 1e6, wall_s);
+    std::printf("{\"batches\":%zu,\"accesses\":%llu,\"budget_rows\":%llu,\"readers\":%u,\"compute_us\":%.1f,\"chunk_kib\":%llu,"
                 "\"hit_rate\":%.6f,\"misses\":%llu,\"miss_bytes\":%llu,\"fetches\":%llu,\"evictions\":%llu,"
                 "\"wait_p50_us\":%.1f,\"wait_p90_us\":%.1f,\"wait_p99_us\":%.1f,\"wait_max_us\":%.1f,"
-                "\"stall_s\":%.4f,\"wall_s\":%.4f}\n",
+                "\"stall_s\":%.4f,\"prefetch_s\":%.4f,\"wall_s\":%.4f}\n",
                 batches, static_cast<unsigned long long>(accesses), static_cast<unsigned long long>(budget_rows), o.readers,
-                o.compute_us, hit_rate, static_cast<unsigned long long>(misses), static_cast<unsigned long long>(miss_bytes),
+                o.compute_us, static_cast<unsigned long long>(o.chunk_kib), hit_rate, static_cast<unsigned long long>(misses), static_cast<unsigned long long>(miss_bytes),
                 static_cast<unsigned long long>(stats.fetches), static_cast<unsigned long long>(stats.evictions),
                 percentile(waits_us, 0.5), percentile(waits_us, 0.9), percentile(waits_us, 0.99),
-                waits_us.empty() ? 0.0 : waits_us.back(), stall_us / 1e6, wall_s);
+                waits_us.empty() ? 0.0 : waits_us.back(), stall_us / 1e6, prefetch_us / 1e6, wall_s);
     return 0;
 }

@@ -54,6 +54,7 @@ selection. See Sub0Llm `docs/STORAGE_STACK_PLAN.md`.
 | `--readers N` | backend read threads (I/O queue depth) | 8 |
 | `--compute-us X` | synthetic compute per batch | 0 |
 | `--limit-batches N` | replay only the first N batches | whole trace |
+| `--chunk-kib N` | `TableConfig::fill_chunk_bytes`: split each row's fill into reads of N KiB | 0 (whole rows) |
 
 ## Report
 

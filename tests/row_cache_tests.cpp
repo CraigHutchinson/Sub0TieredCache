@@ -432,6 +432,47 @@ void test_row_extent_validation() {
           "an exact table still refuses a row shorter than source_row_bytes");
 }
 
+void test_chunked_fills_publish_whole_rows() {
+    constexpr std::uint64_t stride = 16, rows = 12;
+    Backend backend(64);
+    BoundedResolver bounded{stride, rows};
+    std::vector<std::byte> output(4 * stride);
+    const auto sources = single_source(SourceId{1}, rows * stride);
+    // Bounded rows of 1..16 bytes filled in 3-byte chunks: many rows end in a short chunk.
+    TableConfig cfg = bounded_config(stride, rows, output, sources, RowExtentResolverRef(bounded));
+    cfg.fill_chunk_bytes = 3;
+    auto table = Table::create(cfg, FillBackendRef(backend));
+    check(table.has_value(), "a chunked bounded identity table registers");
+    {
+        BackgroundCompleter pump(backend);
+        const std::array<std::uint64_t, 5> request{3, 0, 7, 3, 11};
+        std::vector<RowLease> out(request.size());
+        auto result = (*table)->resolve_into(request, out);
+        check(result.has_value() && *result == request.size(), "a chunked batch with a duplicate resolves fully");
+        for (std::size_t i = 0; i < request.size(); ++i) {
+            check(out[i].bytes().size() == BoundedResolver::length(request[i], stride),
+                  "a chunked row publishes its own whole length");
+            check(matches_source(out[i].bytes(), request[i] * stride), "every chunk of a row matches the source oracle");
+        }
+        check((*table)->stats().fetches == 4, "a chunked row is still one fetch (four distinct rows)");
+    }
+    backend.complete_all_newest_first();
+    (void)(*table)->drain();
+
+    TableConfig widening = cfg;
+    std::vector<std::byte> wide(4 * stride * 2), scratch(stride);
+    widening.row_extent = RowExtent::exact;
+    widening.representation = Representation::bf16_to_f32;
+    widening.output_row_bytes = stride * 2;
+    widening.output_storage = wide;
+    widening.scratch_storage = scratch;
+    widening.scratch_rows = 1;
+    FixedWidthResolver fixed{stride, rows};
+    widening.resolve_extent = RowExtentResolverRef(fixed);
+    check(Table::create(widening, FillBackendRef(backend)).error() == Status::unsupported_conversion,
+          "chunked fills are refused for a converting representation");
+}
+
 void test_bf16_to_f32_bit_exact() {
     Backend backend(8);
     const std::uint64_t elements = 4;
@@ -548,5 +589,6 @@ int main() {
     run(test_stats_snapshot, "stats_snapshot");
     run(test_bounded_rows_publish_their_own_length, "bounded_rows_publish_their_own_length");
     run(test_row_extent_validation, "row_extent_validation");
+    run(test_chunked_fills_publish_whole_rows, "chunked_fills_publish_whole_rows");
     return finish();
 }
