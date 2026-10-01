@@ -19,6 +19,7 @@ function(sub0tieredcache_add_test name source)
 endfunction()
 
 sub0tieredcache_add_test(sub0tieredcache-row-cache-tests row_cache_tests.cpp)
+sub0tieredcache_add_test(sub0tieredcache-size-classed-table-tests size_classed_table_tests.cpp)
 sub0tieredcache_add_test(sub0tieredcache-concurrency-tests concurrency_tests.cpp)
 sub0tieredcache_add_test(sub0tieredcache-allocation-tests allocation_tests.cpp)
 sub0tieredcache_add_test(sub0tieredcache-lifecycle-tests lifecycle_tests.cpp)

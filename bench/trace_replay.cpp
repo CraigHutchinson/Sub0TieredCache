@@ -41,6 +41,7 @@ struct Options {
     double compute_us = 0;          // synthetic compute per batch, after its rows are resident
     std::uint64_t chunk_kib = 0;     // TableConfig::fill_chunk_bytes in KiB (0 = one read per row)
     std::uint64_t limit_batches = 0; // 0 = whole trace
+    bool size_classed = false;       // SizeClassedTable (exact-width slots per row length), not one padded Table
 };
 
 [[noreturn]] void fail(const std::string& message) {
@@ -133,12 +134,63 @@ Options parse(int argc, char** argv) {
         else if (a == "--compute-us") o.compute_us = std::stod(next());
         else if (a == "--limit-batches") o.limit_batches = std::stoull(next());
         else if (a == "--chunk-kib") o.chunk_kib = std::stoull(next());
+        else if (a == "--size-classed") o.size_classed = true;
         else fail("unknown argument " + std::string(a));
     }
     if (o.data.empty() || o.extents.empty() || o.trace.empty())
         fail("usage: --data FILE --extents FILE --trace FILE [--budget-mib N] [--readers N] [--compute-us X] "
-             "[--limit-batches N] [--chunk-kib N]");
+             "[--limit-batches N] [--chunk-kib N] [--size-classed]");
     return o;
+}
+
+struct Replay {
+    std::uint64_t accesses = 0, misses = 0, miss_bytes = 0;
+    double stall_us = 0, prefetch_us = 0, wall_s = 0;
+    std::vector<double> waits_us; // sorted on return
+    TableStats stats{};
+};
+
+// The consumer loop, shared by every table type so the variants differ only in the cache.
+template <class TableT>
+Replay replay(TableT& table, const Trace& trace, const std::vector<Extent>& extents, std::size_t batches,
+              std::uint32_t max_batch, double compute_us) {
+    Replay r;
+    std::vector<RowLease> leases(max_batch);
+    r.waits_us.reserve(trace.rows.size());
+    const auto compute = std::chrono::duration<double, std::micro>(compute_us);
+    const auto t0 = Clock::now();
+    for (std::size_t b = 0; b < batches; ++b) {
+        const std::span<const std::uint64_t> rows(trace.rows.data() + trace.starts[b], trace.starts[b + 1] - trace.starts[b]);
+        for (auto& lease : leases) lease.reset();
+        const auto issued = Clock::now();
+        (void)table.prefetch(rows); // a hint: per-row admission failures surface in resolve_into below
+        r.prefetch_us += std::chrono::duration<double, std::micro>(Clock::now() - issued).count();
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            ++r.accesses;
+            if (auto hit = table.try_get(rows[i])) {
+                leases[i] = std::move(*hit);
+                continue;
+            }
+            ++r.misses;
+            r.miss_bytes += extents[static_cast<std::size_t>(rows[i])].length;
+            const auto start = Clock::now();
+            const auto resolved = table.resolve_into(rows.subspan(i, 1), std::span(leases).subspan(i, 1));
+            const double waited = std::chrono::duration<double, std::micro>(Clock::now() - start).count();
+            if (!resolved) fail(std::string("resolve failed at batch ") + std::to_string(b));
+            r.waits_us.push_back(waited);
+            r.stall_us += waited;
+        }
+        if (compute_us > 0) {
+            const auto until = Clock::now() + std::chrono::duration_cast<Clock::duration>(compute);
+            while (Clock::now() < until) {} // busy, like the compute it stands in for
+        }
+    }
+    r.wall_s = std::chrono::duration<double>(Clock::now() - t0).count();
+    for (auto& lease : leases) lease.reset();
+    (void)table.drain();
+    std::sort(r.waits_us.begin(), r.waits_us.end());
+    r.stats = table.stats();
+    return r;
 }
 
 } // namespace
@@ -153,8 +205,7 @@ int main(int argc, char** argv) {
     const std::size_t batch_count = trace.starts.size() - 1;
     for (std::size_t b = 0; b < batch_count; ++b)
         max_batch = std::max<std::uint32_t>(max_batch, static_cast<std::uint32_t>(trace.starts[b + 1] - trace.starts[b]));
-    const std::uint64_t budget_rows = std::min<std::uint64_t>((o.budget_mib << 20) / row_bytes, extents.size());
-    if (budget_rows < 2ull * max_batch) fail("budget holds fewer than two batches");
+    const std::uint64_t storage_bytes = std::min<std::uint64_t>(o.budget_mib << 20, row_bytes * extents.size());
 
     std::error_code ec;
     const auto file_bytes = std::filesystem::file_size(o.data, ec);
@@ -168,85 +219,75 @@ int main(int argc, char** argv) {
     constexpr auto kSource = static_cast<sub0mempage::SourceId>(1);
     if ((*backend)->register_file(kSource, o.data) != sub0mempage::Status::ok) fail("cannot register " + o.data);
 
-    std::vector<std::byte> storage(static_cast<std::size_t>(budget_rows * row_bytes));
+    std::vector<std::byte> storage(static_cast<std::size_t>(storage_bytes));
     Resolver resolver{&extents};
     const auto sources = single_source(kSource, file_bytes);
-    TableConfig cfg{};
-    cfg.row_count = extents.size();
-    cfg.source_row_bytes = row_bytes;
-    cfg.output_row_bytes = row_bytes;
-    cfg.row_extent = RowExtent::bounded;
-    cfg.sources = sources;
-    cfg.generation = 1;
-    cfg.resolve_extent = RowExtentResolverRef(resolver);
-    cfg.output_storage = storage;
-    cfg.budget_rows = static_cast<std::uint32_t>(budget_rows);
-    cfg.max_tickets = 4;
-    cfg.max_batch_rows = max_batch;
-    cfg.fill_chunk_bytes = chunk_bytes;
-    auto table = Table::create(cfg, sub0mempage::FillBackendRef(**backend));
-    if (!table) fail("table create failed");
-
     const std::size_t batches = o.limit_batches ? std::min<std::size_t>(batch_count, o.limit_batches) : batch_count;
-    std::vector<RowLease> leases(max_batch);
-    std::vector<double> waits_us;
-    waits_us.reserve(trace.rows.size());
-    std::uint64_t accesses = 0, misses = 0, miss_bytes = 0;
-    double stall_us = 0, prefetch_us = 0;
-    const auto compute = std::chrono::duration<double, std::micro>(o.compute_us);
 
-    const auto t0 = Clock::now();
-    for (std::size_t b = 0; b < batches; ++b) {
-        const std::span<const std::uint64_t> rows(trace.rows.data() + trace.starts[b], trace.starts[b + 1] - trace.starts[b]);
-        for (auto& lease : leases) lease.reset();
-        const auto issued = Clock::now();
-        (void)(*table)->prefetch(rows); // a hint: per-row admission failures surface in resolve_into below
-        prefetch_us += std::chrono::duration<double, std::micro>(Clock::now() - issued).count();
-        for (std::size_t i = 0; i < rows.size(); ++i) {
-            ++accesses;
-            if (auto hit = (*table)->try_get(rows[i])) {
-                leases[i] = std::move(*hit);
-                continue;
-            }
-            ++misses;
-            miss_bytes += extents[static_cast<std::size_t>(rows[i])].length;
-            const auto start = Clock::now();
-            const auto resolved = (*table)->resolve_into(rows.subspan(i, 1), std::span(leases).subspan(i, 1));
-            const double waited = std::chrono::duration<double, std::micro>(Clock::now() - start).count();
-            if (!resolved) fail(std::string("resolve failed at batch ") + std::to_string(b));
-            waits_us.push_back(waited);
-            stall_us += waited;
+    std::uint64_t budget_rows = 0, used_bytes = 0;
+    Replay r;
+    if (o.size_classed) {
+        SizeClassedTableConfig cfg{};
+        cfg.row_count = extents.size();
+        cfg.sources = sources;
+        cfg.generation = 1;
+        cfg.resolve_extent = RowExtentResolverRef(resolver);
+        cfg.output_storage = storage;
+        cfg.max_tickets = 4;
+        cfg.max_batch_rows = max_batch;
+        cfg.fill_chunk_bytes = chunk_bytes;
+        auto table = SizeClassedTable::create(cfg, sub0mempage::FillBackendRef(**backend));
+        if (!table) fail("size-classed table create failed (budget below two batches per class?)");
+        for (const auto& cls : (*table)->classes()) {
+            budget_rows += cls.budget_rows;
+            used_bytes += cls.budget_rows * cls.width;
+            std::printf("  class %llu B: %llu rows, %u resident\n", static_cast<unsigned long long>(cls.width),
+                        static_cast<unsigned long long>(cls.rows), cls.budget_rows);
         }
-        if (o.compute_us > 0) {
-            const auto until = Clock::now() + std::chrono::duration_cast<Clock::duration>(compute);
-            while (Clock::now() < until) {} // busy, like the compute it stands in for
-        }
+        r = replay(**table, trace, extents, batches, max_batch, o.compute_us);
+    } else {
+        budget_rows = storage_bytes / row_bytes;
+        used_bytes = budget_rows * row_bytes;
+        if (budget_rows < 2ull * max_batch) fail("budget holds fewer than two batches");
+        TableConfig cfg{};
+        cfg.row_count = extents.size();
+        cfg.source_row_bytes = row_bytes;
+        cfg.output_row_bytes = row_bytes;
+        cfg.row_extent = RowExtent::bounded;
+        cfg.sources = sources;
+        cfg.generation = 1;
+        cfg.resolve_extent = RowExtentResolverRef(resolver);
+        cfg.output_storage = std::span(storage).first(static_cast<std::size_t>(used_bytes));
+        cfg.budget_rows = static_cast<std::uint32_t>(budget_rows);
+        cfg.max_tickets = 4;
+        cfg.max_batch_rows = max_batch;
+        cfg.fill_chunk_bytes = chunk_bytes;
+        auto table = Table::create(cfg, sub0mempage::FillBackendRef(**backend));
+        if (!table) fail("table create failed");
+        r = replay(**table, trace, extents, batches, max_batch, o.compute_us);
     }
-    const double wall_s = std::chrono::duration<double>(Clock::now() - t0).count();
-    for (auto& lease : leases) lease.reset();
-    (void)(*table)->drain();
 
-    std::sort(waits_us.begin(), waits_us.end());
-    const auto stats = (*table)->stats();
-    const double hit_rate = accesses ? 1.0 - static_cast<double>(misses) / static_cast<double>(accesses) : 0;
-    std::printf("trace-replay: %zu batches, %llu accesses, budget %llu rows (%.1f GiB), %u readers, compute %.0f us/batch, chunk %llu KiB\n",
-                batches, static_cast<unsigned long long>(accesses), static_cast<unsigned long long>(budget_rows),
-                static_cast<double>(budget_rows * row_bytes) / (1ull << 30), o.readers, o.compute_us,
-                static_cast<unsigned long long>(o.chunk_kib));
+    const double hit_rate = r.accesses ? 1.0 - static_cast<double>(r.misses) / static_cast<double>(r.accesses) : 0;
+    auto& w = r.waits_us;
+    std::printf("trace-replay: %zu batches, %llu accesses, budget %llu rows (%.1f GiB), %u readers, compute %.0f us/batch, chunk %llu KiB%s\n",
+                batches, static_cast<unsigned long long>(r.accesses), static_cast<unsigned long long>(budget_rows),
+                static_cast<double>(used_bytes) / (1ull << 30), o.readers, o.compute_us,
+                static_cast<unsigned long long>(o.chunk_kib), o.size_classed ? ", size-classed" : "");
     std::printf("  hit rate %.2f%% | misses %llu (%.2f GiB read) | fetches %llu, evictions %llu\n", 100 * hit_rate,
-                static_cast<unsigned long long>(misses), static_cast<double>(miss_bytes) / (1ull << 30),
-                static_cast<unsigned long long>(stats.fetches), static_cast<unsigned long long>(stats.evictions));
+                static_cast<unsigned long long>(r.misses), static_cast<double>(r.miss_bytes) / (1ull << 30),
+                static_cast<unsigned long long>(r.stats.fetches), static_cast<unsigned long long>(r.stats.evictions));
     std::printf("  miss wait us: p50 %.0f  p90 %.0f  p99 %.0f  max %.0f | total stall %.2f s, prefetch %.2f s, of %.2f s wall\n",
-                percentile(waits_us, 0.5), percentile(waits_us, 0.9), percentile(waits_us, 0.99),
-                waits_us.empty() ? 0.0 : waits_us.back(), stall_us / 1e6, prefetch_us / 1e6, wall_s);
-    std::printf("{\"batches\":%zu,\"accesses\":%llu,\"budget_rows\":%llu,\"readers\":%u,\"compute_us\":%.1f,\"chunk_kib\":%llu,"
-                "\"hit_rate\":%.6f,\"misses\":%llu,\"miss_bytes\":%llu,\"fetches\":%llu,\"evictions\":%llu,"
+                percentile(w, 0.5), percentile(w, 0.9), percentile(w, 0.99), w.empty() ? 0.0 : w.back(),
+                r.stall_us / 1e6, r.prefetch_us / 1e6, r.wall_s);
+    std::printf("{\"batches\":%zu,\"accesses\":%llu,\"budget_rows\":%llu,\"size_classed\":%s,\"readers\":%u,\"compute_us\":%.1f,"
+                "\"chunk_kib\":%llu,\"hit_rate\":%.6f,\"misses\":%llu,\"miss_bytes\":%llu,\"fetches\":%llu,\"evictions\":%llu,"
                 "\"wait_p50_us\":%.1f,\"wait_p90_us\":%.1f,\"wait_p99_us\":%.1f,\"wait_max_us\":%.1f,"
                 "\"stall_s\":%.4f,\"prefetch_s\":%.4f,\"wall_s\":%.4f}\n",
-                batches, static_cast<unsigned long long>(accesses), static_cast<unsigned long long>(budget_rows), o.readers,
-                o.compute_us, static_cast<unsigned long long>(o.chunk_kib), hit_rate, static_cast<unsigned long long>(misses), static_cast<unsigned long long>(miss_bytes),
-                static_cast<unsigned long long>(stats.fetches), static_cast<unsigned long long>(stats.evictions),
-                percentile(waits_us, 0.5), percentile(waits_us, 0.9), percentile(waits_us, 0.99),
-                waits_us.empty() ? 0.0 : waits_us.back(), stall_us / 1e6, prefetch_us / 1e6, wall_s);
+                batches, static_cast<unsigned long long>(r.accesses), static_cast<unsigned long long>(budget_rows),
+                o.size_classed ? "true" : "false", o.readers, o.compute_us, static_cast<unsigned long long>(o.chunk_kib),
+                hit_rate, static_cast<unsigned long long>(r.misses), static_cast<unsigned long long>(r.miss_bytes),
+                static_cast<unsigned long long>(r.stats.fetches), static_cast<unsigned long long>(r.stats.evictions),
+                percentile(w, 0.5), percentile(w, 0.9), percentile(w, 0.99), w.empty() ? 0.0 : w.back(),
+                r.stall_us / 1e6, r.prefetch_us / 1e6, r.wall_s);
     return 0;
 }

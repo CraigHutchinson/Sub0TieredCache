@@ -29,6 +29,7 @@
 
 #include "sub0tieredcache/codec.hpp"
 #include "sub0tieredcache/row_cache.hpp"
+#include "sub0tieredcache/size_classed_table.hpp"
 #include "sub0tieredcache/status.hpp"
 
 namespace sub0tieredcache {

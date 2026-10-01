@@ -55,6 +55,7 @@ selection. See Sub0Llm `docs/STORAGE_STACK_PLAN.md`.
 | `--compute-us X` | synthetic compute per batch | 0 |
 | `--limit-batches N` | replay only the first N batches | whole trace |
 | `--chunk-kib N` | `TableConfig::fill_chunk_bytes`: split each row's fill into reads of N KiB | 0 (whole rows) |
+| `--size-classed` | `SizeClassedTable`: one exact-width table per distinct row length, instead of one table padded to the widest row | off |
 
 ## Report
 
