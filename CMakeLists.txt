@@ -12,6 +12,7 @@ include(GNUInstallDirs)
 
 option(SUB0TIEREDCACHE_BUILD_TESTING  "Build unit-tests" ON)
 option(SUB0TIEREDCACHE_BUILD_EXAMPLES "Build examples"   OFF)
+option(SUB0TIEREDCACHE_BUILD_BENCHMARKS "Build the trace-replay benchmark (docs/trace-replay.md)" OFF)
 
 if(SUB0TIEREDCACHE_BUILD_TESTING AND NOT IS_SUBPROJECT)
     enable_testing()
@@ -72,4 +73,8 @@ target_link_libraries(Sub0TieredCache INTERFACE Sub0MemPage::Sub0MemPage)
 
 if(SUB0TIEREDCACHE_BUILD_TESTING AND NOT IS_SUBPROJECT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
+endif()
+
+if(SUB0TIEREDCACHE_BUILD_BENCHMARKS)
+    add_subdirectory(bench)
 endif()
