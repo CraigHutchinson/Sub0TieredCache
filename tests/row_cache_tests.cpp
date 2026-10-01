@@ -315,6 +315,123 @@ void test_try_get_never_touches_transport() {
     check(lease.has_value() && matches_source(lease->bytes(), 0), "try_get hits once the row is Ready");
 }
 
+/// Rows packed back to back with lengths 1..stride, the shape of a variable-size blob table (e.g. one
+/// row per MoE expert whose planes differ in size between layers). Row r starts at r * stride.
+struct BoundedResolver {
+    std::uint64_t stride = 0;
+    std::uint64_t row_count = 0;
+
+    [[nodiscard]] static constexpr std::uint64_t length(std::uint64_t row, std::uint64_t stride) noexcept {
+        return 1 + (row * 5) % stride; // varies per row, never 0, never above stride
+    }
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t row) const noexcept {
+        if (row >= row_count) {
+            return std::unexpected(Status::out_of_range);
+        }
+        return RowLocation{0, ByteRange{row * stride, length(row, stride)}};
+    }
+};
+
+/// Same table, but one row resolves to `bad_length` -- longer than the slot, or empty.
+struct OneBadLengthResolver {
+    std::uint64_t stride = 0;
+    std::uint64_t bad_length = 0;
+
+    [[nodiscard]] std::expected<RowLocation, Status> resolve_extent(std::uint64_t row) const noexcept {
+        return RowLocation{0, ByteRange{row * stride, row == 1 ? bad_length : stride}};
+    }
+};
+
+[[nodiscard]] TableConfig bounded_config(std::uint64_t stride, std::uint64_t rows, std::span<std::byte> output,
+                                         std::span<const ShardSource> sources, RowExtentResolverRef resolver) {
+    TableConfig cfg{};
+    cfg.row_count = rows;
+    cfg.source_row_bytes = stride;
+    cfg.output_row_bytes = stride;
+    cfg.row_extent = RowExtent::bounded;
+    cfg.sources = sources;
+    cfg.generation = 1;
+    cfg.resolve_extent = resolver;
+    cfg.output_storage = output;
+    cfg.budget_rows = static_cast<std::uint32_t>(output.size() / stride);
+    cfg.max_tickets = 2;
+    cfg.max_batch_rows = 8;
+    return cfg;
+}
+
+void test_bounded_rows_publish_their_own_length() {
+    constexpr std::uint64_t stride = 16, rows = 12;
+    Backend backend(16);
+    BoundedResolver resolver{stride, rows};
+    std::vector<std::byte> output(4 * stride);
+    const auto sources = single_source(SourceId{1}, rows * stride);
+    auto table = Table::create(bounded_config(stride, rows, output, sources, RowExtentResolverRef(resolver)),
+                               FillBackendRef(backend));
+    check(table.has_value(), "a bounded identity table registers");
+    {
+        BackgroundCompleter pump(backend);
+        const std::array<std::uint64_t, 5> request{3, 0, 7, 3, 11};
+        std::vector<RowLease> out(request.size());
+        auto result = (*table)->resolve_into(request, out);
+        check(result.has_value() && *result == request.size(), "a bounded batch with a duplicate resolves fully");
+        for (std::size_t i = 0; i < request.size(); ++i) {
+            const std::uint64_t row = request[i];
+            check(out[i].bytes().size() == BoundedResolver::length(row, stride),
+                  "a bounded lease exposes exactly its own row's length, not the slot width");
+            check(matches_source(out[i].bytes(), row * stride), "bounded lease bytes match the source oracle");
+        }
+        out.clear();
+        auto hit = (*table)->try_get(7);
+        check(hit.has_value() && hit->bytes().size() == BoundedResolver::length(7, stride),
+              "try_get on a resident bounded row reports that row's own length");
+    }
+    backend.complete_all_newest_first();
+    (void)(*table)->drain();
+}
+
+void test_row_extent_validation() {
+    constexpr std::uint64_t stride = 16, rows = 4;
+    Backend backend(8);
+    std::vector<std::byte> output(2 * stride);
+    const auto sources = single_source(SourceId{1}, rows * stride);
+
+    BoundedResolver resolver{stride, rows};
+    TableConfig widening = bounded_config(stride, rows, output, sources, RowExtentResolverRef(resolver));
+    std::vector<std::byte> wide_output(2 * stride * 2), scratch(stride);
+    widening.representation = Representation::bf16_to_f32;
+    widening.output_row_bytes = stride * 2;
+    widening.output_storage = wide_output;
+    widening.scratch_storage = scratch;
+    widening.scratch_rows = 1;
+    check(Table::create(widening, FillBackendRef(backend)).error() == Status::unsupported_conversion,
+          "bounded rows are refused for a widening representation");
+
+    for (const std::uint64_t bad : {stride + 1, std::uint64_t{0}}) {
+        OneBadLengthResolver bad_resolver{stride, bad};
+        auto table = Table::create(bounded_config(stride, rows, output, sources, RowExtentResolverRef(bad_resolver)),
+                                   FillBackendRef(backend));
+        check(table.has_value(), "the bounded table itself registers");
+        BackgroundCompleter pump(backend);
+        std::vector<RowLease> out(1);
+        auto result = (*table)->resolve_into(std::array<std::uint64_t, 1>{1}, out);
+        check(!result.has_value() && result.error() == Status::invalid_argument,
+              "a bounded row longer than the slot, or empty, fails its request");
+        check(!out[0].is_held(), "the failed bounded request leaves no lease held");
+    }
+
+    // Exact tables keep refusing short rows: the default contract is unchanged (AGENTS.md sec 7).
+    OneBadLengthResolver short_resolver{stride, stride - 1};
+    TableConfig exact = bounded_config(stride, rows, output, sources, RowExtentResolverRef(short_resolver));
+    exact.row_extent = RowExtent::exact;
+    auto table = Table::create(exact, FillBackendRef(backend));
+    check(table.has_value(), "an exact table registers");
+    BackgroundCompleter pump(backend);
+    std::vector<RowLease> out(1);
+    auto result = (*table)->resolve_into(std::array<std::uint64_t, 1>{1}, out);
+    check(!result.has_value() && result.error() == Status::invalid_argument,
+          "an exact table still refuses a row shorter than source_row_bytes");
+}
+
 void test_bf16_to_f32_bit_exact() {
     Backend backend(8);
     const std::uint64_t elements = 4;
@@ -429,5 +546,7 @@ int main() {
     run(test_bf16_to_f32_bit_exact, "bf16_to_f32_bit_exact");
     run(test_bf16_codec_special_values, "bf16_codec_special_values");
     run(test_stats_snapshot, "stats_snapshot");
+    run(test_bounded_rows_publish_their_own_length, "bounded_rows_publish_their_own_length");
+    run(test_row_extent_validation, "row_extent_validation");
     return finish();
 }

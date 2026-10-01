@@ -129,6 +129,13 @@ enum class Representation : std::uint8_t {
 /// sources"): a table's rows may live across more than one immutable source, each with its own identity
 /// -- an external shard set (e.g. safetensors' `model-NNNNN-of-MMMMM.safetensors`), not a format this
 /// core parses (AGENTS.md sec 2), just a bounded list of (SourceId, extent) pairs the caller supplies.
+/// Whether every resolved row spans exactly `TableConfig::source_row_bytes`, or may be shorter.
+enum class RowExtent : std::uint8_t {
+    exact,   ///< Every location's length must equal source_row_bytes (rows of one fixed width).
+    bounded, ///< A location may be 1..source_row_bytes long; leases expose that row's own length.
+             ///< Identity representation only: a widening codec has no defined output for a short row.
+};
+
 struct ShardSource {
     sub0mempage::SourceId source{};
     std::uint64_t bytes = 0;
@@ -281,7 +288,8 @@ struct TableStats {
 /// one call -- see single_source() for the common single-shard case.
 struct TableConfig {
     std::uint64_t row_count = 0;              ///< Addressable row_index range is [0, row_count).
-    std::uint64_t source_row_bytes = 0;       ///< Encoded row width the adapter's locations must have.
+    std::uint64_t source_row_bytes = 0;       ///< Encoded row width (exact), or the maximum (bounded).
+    RowExtent row_extent = RowExtent::exact;  ///< Whether resolved rows may be shorter than source_row_bytes.
     std::uint64_t output_row_bytes = 0;       ///< Published row width (== source_row_bytes iff identity).
     Representation representation = Representation::identity;
     Codec* codec = nullptr;                   ///< Required iff representation == custom; unused otherwise.
@@ -442,6 +450,7 @@ private:
         Binding* fill_binding = nullptr; ///< Non-owning; which binding's in_flight counter to release.
         std::optional<sub0mempage::Claim> claim; ///< Live only while state == filling.
         std::uint32_t scratch_slot = NONE;       ///< Valid only while converting and state == filling.
+        std::uint64_t published_bytes = 0;       ///< Lease length once Ready: output_row_bytes unless bounded.
     };
 
     struct TicketRecord {
@@ -504,6 +513,10 @@ private:
 
     [[nodiscard]] std::span<std::byte> output_span(std::uint32_t slot) const noexcept {
         return config_.output_storage.subspan(std::size_t{slot} * config_.output_row_bytes, config_.output_row_bytes);
+    }
+    /// The bytes a lease on a Ready slot exposes: the whole slot, or a bounded row's own length.
+    [[nodiscard]] std::span<const std::byte> published_span(std::uint32_t slot) const noexcept {
+        return output_span(slot).first(static_cast<std::size_t>(slots_[slot].published_bytes));
     }
     [[nodiscard]] std::span<std::byte> scratch_span(std::uint32_t index) const noexcept {
         return config_.scratch_storage.subspan(std::size_t{index} * config_.source_row_bytes, config_.source_row_bytes);
@@ -658,6 +671,9 @@ inline std::expected<std::unique_ptr<Table>, Status> Table::create(const TableCo
     if (config.output_row_bytes > SIZE_MAX / config.budget_rows ||
         config.output_storage.size() != std::size_t{config.output_row_bytes} * config.budget_rows) {
         return std::unexpected(Status::invalid_argument);
+    }
+    if (config.row_extent == RowExtent::bounded && config.representation != Representation::identity) {
+        return std::unexpected(Status::unsupported_conversion); // see RowExtent::bounded
     }
     if (config.representation != Representation::identity) {
         if (config.scratch_rows == 0 ||
@@ -912,7 +928,10 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
     if (shard >= current_binding_->sources.size()) {
         return fail(Status::out_of_range); // the resolver named a shard this binding never registered
     }
-    if (location->range.length != config_.source_row_bytes) {
+    const bool length_ok = config_.row_extent == RowExtent::bounded
+                               ? location->range.length != 0 && location->range.length <= config_.source_row_bytes
+                               : location->range.length == config_.source_row_bytes;
+    if (!length_ok) {
         return fail(Status::invalid_argument);
     }
     // Defense in depth: TransferSet::submit below already validates the range against ITS OWN
@@ -945,6 +964,7 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
         s.scratch_slot = scratch;
         s.claim = std::move(*claim);
     }
+    s.published_bytes = config_.row_extent == RowExtent::bounded ? location->range.length : config_.output_row_bytes;
     ++in_flight_;
     ++current_binding_->in_flight;
     ++counters_.fetches;
@@ -1147,7 +1167,7 @@ inline std::expected<RowLease, Status> Table::resolve_one(std::uint64_t row_inde
         lease.table_ = this;
         lease.slot_ = slot;
         lease.epoch_ = epoch;
-        lease.bytes_ = output_span(slot);
+        lease.bytes_ = published_span(slot);
         lease.row_index_ = row_index;
         lease.generation_ = s.row_generation;
         return lease;
@@ -1251,7 +1271,7 @@ inline std::expected<std::size_t, Status> Table::resolve_into(std::span<const st
         if (s.epoch != lease.epoch_) {
             failure = Status::pool_exhausted;
         } else if (s.state == SlotState::ready) {
-            lease.bytes_ = output_span(lease.slot_);
+            lease.bytes_ = published_span(lease.slot_);
         } else {
             failure = s.failure;
         }
@@ -1284,7 +1304,7 @@ inline std::optional<RowLease> Table::try_get(std::uint64_t row_index) noexcept 
     lease.table_ = this;
     lease.slot_ = slot;
     lease.epoch_ = s.epoch;
-    lease.bytes_ = output_span(slot);
+    lease.bytes_ = published_span(slot);
     lease.row_index_ = row_index;
     lease.generation_ = s.row_generation;
     return lease;
