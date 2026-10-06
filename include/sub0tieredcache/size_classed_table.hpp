@@ -41,6 +41,9 @@ struct SizeClassedTableConfig {
     std::uint32_t max_tickets = 0;            ///< Per class, as TableConfig::max_tickets.
     std::uint32_t max_batch_rows = 0;         ///< Per call, as TableConfig::max_batch_rows.
     std::uint64_t fill_chunk_bytes = 0;       ///< As TableConfig::fill_chunk_bytes, for every class.
+    /// As TableConfig::fill_alignment, for every class: each class's slots widen to
+    /// aligned_slot_bytes(width, fill_alignment), and output_storage must start on that alignment.
+    std::uint64_t fill_alignment = 0;
     std::uint32_t max_classes = 8;            ///< Refuse registration with more distinct row lengths.
 };
 
@@ -58,6 +61,7 @@ public:
     /// One row-length class and its share of the storage.
     struct Class {
         std::uint64_t width = 0;      ///< Exact length of every row in this class.
+        std::uint64_t slot_bytes = 0; ///< Storage per resident row: width, or wider with fill_alignment.
         std::uint64_t rows = 0;       ///< Rows of the table in this class.
         std::uint32_t budget_rows = 0;///< Resident capacity of this class.
     };
@@ -155,22 +159,24 @@ SizeClassedTable::create(const SizeClassedTableConfig& config, sub0mempage::Fill
         t->local_of_[static_cast<std::size_t>(row)] = static_cast<std::uint32_t>(t->global_of_[cls].size());
         t->global_of_[cls].push_back(row);
     }
-    // Split the storage in proportion to each class's total bytes, in whole rows of each class's width.
+    // Split the storage in proportion to each class's total bytes, in whole slots of each class's own size.
     double total_bytes = 0;
     for (std::uint32_t c = 0; c < t->classes_.size(); ++c) {
-        t->classes_[c].rows = t->global_of_[c].size();
-        total_bytes += static_cast<double>(t->classes_[c].rows) * static_cast<double>(t->classes_[c].width);
+        Class& cls = t->classes_[c];
+        cls.rows = t->global_of_[c].size();
+        cls.slot_bytes = config.fill_alignment != 0 ? aligned_slot_bytes(cls.width, config.fill_alignment) : cls.width;
+        total_bytes += static_cast<double>(cls.rows) * static_cast<double>(cls.slot_bytes);
     }
     std::uint64_t used = 0;
     for (auto& cls : t->classes_) {
-        const double share = static_cast<double>(cls.rows) * static_cast<double>(cls.width) / total_bytes;
+        const double share = static_cast<double>(cls.rows) * static_cast<double>(cls.slot_bytes) / total_bytes;
         const auto bytes = static_cast<std::uint64_t>(share * static_cast<double>(config.output_storage.size()));
-        const std::uint64_t rows = std::min<std::uint64_t>(bytes / cls.width, cls.rows);
+        const std::uint64_t rows = std::min<std::uint64_t>(bytes / cls.slot_bytes, cls.rows);
         // Two batches of rows, so one batch can stay leased while the next fills -- or the whole class.
         if (rows < std::min<std::uint64_t>(2ull * config.max_batch_rows, cls.rows) || rows >= UINT32_MAX)
             return std::unexpected(Status::invalid_argument);
         cls.budget_rows = static_cast<std::uint32_t>(rows);
-        used += rows * cls.width;
+        used += rows * cls.slot_bytes;
     }
     if (used > config.output_storage.size()) return std::unexpected(Status::invalid_argument);
     // One exact-width Table per class over its own slice of the storage.
@@ -181,23 +187,24 @@ SizeClassedTable::create(const SizeClassedTableConfig& config, sub0mempage::Fill
         TableConfig tc{};
         tc.row_count = cls.rows;
         tc.source_row_bytes = cls.width;
-        tc.output_row_bytes = cls.width;
+        tc.output_row_bytes = cls.slot_bytes;
         tc.row_extent = RowExtent::exact;
         tc.representation = Representation::identity;
         tc.sources = config.sources;
         tc.generation = config.generation;
         tc.resolve_extent = RowExtentResolverRef(*t->resolvers_.back());
         tc.output_storage = config.output_storage.subspan(static_cast<std::size_t>(at),
-                                                          static_cast<std::size_t>(cls.budget_rows * cls.width));
+                                                          static_cast<std::size_t>(cls.budget_rows * cls.slot_bytes));
         tc.budget_rows = cls.budget_rows;
         tc.max_tickets = config.max_tickets;
         tc.max_batch_rows = config.max_batch_rows;
         tc.fill_chunk_bytes = config.fill_chunk_bytes;
+        tc.fill_alignment = config.fill_alignment;
         auto table = Table::create(tc, backend);
         if (!table) return std::unexpected(table.error());
         t->tables_.push_back(std::move(*table));
         t->scratch_.emplace_back(config.max_batch_rows);
-        at += cls.budget_rows * cls.width;
+        at += cls.budget_rows * cls.slot_bytes;
     }
     return t;
 }

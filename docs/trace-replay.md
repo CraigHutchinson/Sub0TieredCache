@@ -56,6 +56,7 @@ selection. See Sub0Llm `docs/STORAGE_STACK_PLAN.md`.
 | `--limit-batches N` | replay only the first N batches | whole trace |
 | `--chunk-kib N` | `TableConfig::fill_chunk_bytes`: split each row's fill into reads of N KiB | 0 (whole rows) |
 | `--size-classed` | `SizeClassedTable`: one exact-width table per distinct row length, instead of one table padded to the widest row | off |
+| `--uncached` | fill through `sub0mempage::FileAccess::uncached` into aligned-window slots (`fill_alignment`): no OS-cache copy. Evict the data file first, and keep it unread through the cache | off |
 
 ## Report
 

@@ -281,6 +281,12 @@ struct TableStats {
     std::uint64_t failed = 0;          ///< Terminal transport/codec failures observed.
 };
 
+/// Slot width TableConfig::fill_alignment requires: the widest aligned window a row of `row_bytes` can
+/// need, for a row that starts on the last byte of a block.
+[[nodiscard]] constexpr std::uint64_t aligned_slot_bytes(std::uint64_t row_bytes, std::uint64_t alignment) noexcept {
+    return (row_bytes + 2 * alignment - 2) / alignment * alignment;
+}
+
 /// Registration parameters for one table (an administrative call: may allocate, may block). `sources`,
 /// `generation` and `resolve_extent` seed the table's *initial* binding; later bindings come from
 /// invalidate()'s own arguments, not from re-reading this struct. `sources` is copied into the binding
@@ -294,7 +300,15 @@ struct TableConfig {
     /// so idle backend workers share one row and a miss lands sooner. 0 = one read per row. The backend's
     /// queue must hold max_batch_rows * ceil(source_row_bytes / fill_chunk_bytes) requests.
     std::uint64_t fill_chunk_bytes = 0;
-    std::uint64_t output_row_bytes = 0;       ///< Published row width (== source_row_bytes iff identity).
+    /// Identity only: read each row as the `fill_alignment`-aligned window of its source that contains it,
+    /// straight into its slot, so a backend that requires aligned requests (sub0mempage's
+    /// FileAccess::uncached) can serve the fill with no copy. A lease still exposes exactly the row.
+    /// 0 = off; otherwise a power of two. It needs output_row_bytes ==
+    /// aligned_slot_bytes(source_row_bytes, fill_alignment), output_storage starting on that alignment,
+    /// and fill_chunk_bytes (if set) a multiple of it.
+    std::uint64_t fill_alignment = 0;
+    /// Slot width: source_row_bytes for identity (see fill_alignment for its exception).
+    std::uint64_t output_row_bytes = 0;
     Representation representation = Representation::identity;
     Codec* codec = nullptr;                   ///< Required iff representation == custom; unused otherwise.
     std::span<const ShardSource> sources;     ///< Bounded list of shards for the initial binding (>= 1).
@@ -457,6 +471,7 @@ private:
         std::vector<sub0mempage::Claim> chunk_claims; ///< Sized at construction iff fill_chunk_bytes splits rows.
         std::uint32_t chunk_count = 0;           ///< chunk_claims in use for the current fill (0 = `claim`).
         std::uint64_t published_bytes = 0;       ///< Lease length once Ready: output_row_bytes unless bounded.
+        std::uint64_t published_offset = 0;      ///< Where the row starts in its slot (non-zero only with fill_alignment).
     };
 
     struct TicketRecord {
@@ -522,7 +537,8 @@ private:
     }
     /// The bytes a lease on a Ready slot exposes: the whole slot, or a bounded row's own length.
     [[nodiscard]] std::span<const std::byte> published_span(std::uint32_t slot) const noexcept {
-        return output_span(slot).first(static_cast<std::size_t>(slots_[slot].published_bytes));
+        return output_span(slot).subspan(static_cast<std::size_t>(slots_[slot].published_offset),
+                                         static_cast<std::size_t>(slots_[slot].published_bytes));
     }
     [[nodiscard]] std::span<std::byte> scratch_span(std::uint32_t index) const noexcept {
         return config_.scratch_storage.subspan(std::size_t{index} * config_.source_row_bytes, config_.source_row_bytes);
@@ -535,7 +551,7 @@ private:
     sub0mempage::FillBackendRef backend_;
     Bf16ToF32Codec builtin_bf16_codec_;
     Codec* active_codec_ = nullptr; // nullptr iff identity (no codec step)
-    std::uint32_t chunks_per_row_ = 1; ///< ceil(source_row_bytes / fill_chunk_bytes), or 1
+    std::uint32_t chunks_per_row_ = 1; ///< ceil(widest fill / fill_chunk_bytes), or 1
 
     std::unique_ptr<Binding> current_binding_;
     std::unique_ptr<Binding> retiring_binding_; // null iff no superseded binding is still draining
@@ -659,7 +675,9 @@ inline std::expected<std::unique_ptr<Table>, Status> Table::create(const TableCo
     // the caller's storage span also happens to be the wrong size for it.
     switch (config.representation) {
     case Representation::identity:
-        if (config.output_row_bytes != config.source_row_bytes) {
+        if (config.output_row_bytes != (config.fill_alignment != 0
+                                            ? aligned_slot_bytes(config.source_row_bytes, config.fill_alignment)
+                                            : config.source_row_bytes)) {
             return std::unexpected(Status::unsupported_conversion);
         }
         break;
@@ -684,6 +702,16 @@ inline std::expected<std::unique_ptr<Table>, Status> Table::create(const TableCo
     }
     if (config.fill_chunk_bytes != 0 && config.representation != Representation::identity) {
         return std::unexpected(Status::unsupported_conversion); // see TableConfig::fill_chunk_bytes
+    }
+    if (config.fill_alignment != 0) { // see TableConfig::fill_alignment
+        if (config.representation != Representation::identity) {
+            return std::unexpected(Status::unsupported_conversion);
+        }
+        if (!std::has_single_bit(config.fill_alignment) ||
+            reinterpret_cast<std::uintptr_t>(config.output_storage.data()) % config.fill_alignment != 0 ||
+            config.fill_chunk_bytes % config.fill_alignment != 0) {
+            return std::unexpected(Status::invalid_argument);
+        }
     }
     if (config.representation != Representation::identity) {
         if (config.scratch_rows == 0 ||
@@ -758,8 +786,10 @@ inline Table::Table(Passkey, const TableConfig& config, sub0mempage::FillBackend
       current_generation_(config.generation),
       scratch_used_(config.scratch_rows, false) {
     index_shift_ = 64 - std::countr_zero(index_.size());
-    if (config_.fill_chunk_bytes != 0 && config_.fill_chunk_bytes < config_.source_row_bytes) {
-        chunks_per_row_ = static_cast<std::uint32_t>((config_.source_row_bytes + config_.fill_chunk_bytes - 1) /
+    // The widest single fill: a whole slot when rows are read as aligned windows, else one row.
+    const std::uint64_t fill_bytes = config_.fill_alignment != 0 ? config_.output_row_bytes : config_.source_row_bytes;
+    if (config_.fill_chunk_bytes != 0 && config_.fill_chunk_bytes < fill_bytes) {
+        chunks_per_row_ = static_cast<std::uint32_t>((fill_bytes + config_.fill_chunk_bytes - 1) /
                                                      config_.fill_chunk_bytes);
         for (Slot& slot : slots_) slot.chunk_claims.resize(chunks_per_row_); // administrative: may allocate
     }
@@ -959,14 +989,27 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
         return fail(Status::out_of_range);
     }
 
+    // What is read into the slot: the row, or with fill_alignment the aligned window around it, clipped
+    // at the source's end (where an uncached read may stop mid-block). The row starts `head` bytes in.
+    sub0mempage::ByteRange fill = location->range;
+    std::uint64_t head = 0;
+    if (config_.fill_alignment != 0) {
+        const std::uint64_t alignment = config_.fill_alignment;
+        const std::uint64_t start = fill.offset / alignment * alignment;
+        const std::uint64_t end = std::min((fill.offset + fill.length + alignment - 1) / alignment * alignment,
+                                           current_binding_->sources[shard].bytes);
+        head = fill.offset - start;
+        fill = {start, end - start};
+    }
+
     if (active_codec_ == nullptr && chunks_per_row_ > 1) {
         // One read per chunk, all submitted now, so several backend workers fill this row at once. A
         // partial submission's accepted chunks are released as dropped-in-flight: MemPage refuses any
         // overlapping reuse of their destination until they finish, so no later fill can race them.
         const std::uint64_t base = std::uint64_t{slot} * config_.output_row_bytes;
-        for (std::uint64_t at = 0; at < location->range.length; at += config_.fill_chunk_bytes) {
-            const std::uint64_t length = std::min(config_.fill_chunk_bytes, location->range.length - at);
-            auto claim = current_binding_->row_transfers[shard]->submit({location->range.offset + at, length}, base + at);
+        for (std::uint64_t at = 0; at < fill.length; at += config_.fill_chunk_bytes) {
+            const std::uint64_t length = std::min(config_.fill_chunk_bytes, fill.length - at);
+            auto claim = current_binding_->row_transfers[shard]->submit({fill.offset + at, length}, base + at);
             if (!claim) {
                 for (std::uint32_t c = 0; c < s.chunk_count; ++c) s.chunk_claims[c].reset();
                 s.chunk_count = 0;
@@ -975,7 +1018,7 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
             s.chunk_claims[s.chunk_count++] = std::move(*claim);
         }
     } else if (active_codec_ == nullptr) {
-        auto claim = current_binding_->row_transfers[shard]->submit(location->range, std::uint64_t{slot} * config_.output_row_bytes);
+        auto claim = current_binding_->row_transfers[shard]->submit(fill, std::uint64_t{slot} * config_.output_row_bytes);
         if (!claim) {
             return fail(detail::from_mempage(claim.error()));
         }
@@ -996,7 +1039,9 @@ inline Status Table::start_fill_locked(std::uint32_t slot, std::uint64_t row_ind
         s.scratch_slot = scratch;
         s.claim = std::move(*claim);
     }
-    s.published_bytes = config_.row_extent == RowExtent::bounded ? location->range.length : config_.output_row_bytes;
+    // Identity publishes the row itself (its own length, `head` into the slot); a codec publishes a whole slot.
+    s.published_bytes = active_codec_ == nullptr ? location->range.length : config_.output_row_bytes;
+    s.published_offset = head;
     ++in_flight_;
     ++current_binding_->in_flight;
     ++counters_.fetches;

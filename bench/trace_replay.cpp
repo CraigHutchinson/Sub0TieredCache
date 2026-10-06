@@ -41,6 +41,7 @@ struct Options {
     double compute_us = 0;          // synthetic compute per batch, after its rows are resident
     std::uint64_t chunk_kib = 0;     // TableConfig::fill_chunk_bytes in KiB (0 = one read per row)
     std::uint64_t limit_batches = 0; // 0 = whole trace
+    bool uncached = false;           // FileAccess::uncached fills into aligned-window slots (no OS cache copy)
     bool size_classed = false;       // SizeClassedTable (exact-width slots per row length), not one padded Table
 };
 
@@ -135,11 +136,12 @@ Options parse(int argc, char** argv) {
         else if (a == "--limit-batches") o.limit_batches = std::stoull(next());
         else if (a == "--chunk-kib") o.chunk_kib = std::stoull(next());
         else if (a == "--size-classed") o.size_classed = true;
+        else if (a == "--uncached") o.uncached = true;
         else fail("unknown argument " + std::string(a));
     }
     if (o.data.empty() || o.extents.empty() || o.trace.empty())
         fail("usage: --data FILE --extents FILE --trace FILE [--budget-mib N] [--readers N] [--compute-us X] "
-             "[--limit-batches N] [--chunk-kib N] [--size-classed]");
+             "[--limit-batches N] [--chunk-kib N] [--size-classed] [--uncached]");
     return o;
 }
 
@@ -205,21 +207,29 @@ int main(int argc, char** argv) {
     const std::size_t batch_count = trace.starts.size() - 1;
     for (std::size_t b = 0; b < batch_count; ++b)
         max_batch = std::max<std::uint32_t>(max_batch, static_cast<std::uint32_t>(trace.starts[b + 1] - trace.starts[b]));
-    const std::uint64_t storage_bytes = std::min<std::uint64_t>(o.budget_mib << 20, row_bytes * extents.size());
+    constexpr std::uint64_t kAlign = sub0mempage::kUncachedAlignment;
+    const std::uint64_t alignment = o.uncached ? kAlign : 0;
+    const std::uint64_t slot_bytes = o.uncached ? aligned_slot_bytes(row_bytes, kAlign) : row_bytes;
+    const std::uint64_t storage_bytes = std::min<std::uint64_t>(o.budget_mib << 20, slot_bytes * extents.size()) / kAlign * kAlign;
 
     std::error_code ec;
     const auto file_bytes = std::filesystem::file_size(o.data, ec);
     if (ec) fail("cannot stat " + o.data);
     const std::uint64_t chunk_bytes = o.chunk_kib << 10;
     const auto chunks_per_row = static_cast<std::uint32_t>(
-        chunk_bytes && chunk_bytes < row_bytes ? (row_bytes + chunk_bytes - 1) / chunk_bytes : 1);
+        chunk_bytes && chunk_bytes < slot_bytes ? (slot_bytes + chunk_bytes - 1) / chunk_bytes : 1);
     auto backend = sub0mempage::LocalFileBackend::create(
         {.workers = o.readers, .queue_capacity = 4 * max_batch * chunks_per_row, .max_sources = 1});
     if (!backend) fail("backend create failed");
     constexpr auto kSource = static_cast<sub0mempage::SourceId>(1);
-    if ((*backend)->register_file(kSource, o.data) != sub0mempage::Status::ok) fail("cannot register " + o.data);
+    const auto access = o.uncached ? sub0mempage::FileAccess::uncached : sub0mempage::FileAccess::buffered;
+    if ((*backend)->register_file(kSource, o.data, access) != sub0mempage::Status::ok) fail("cannot register " + o.data);
 
-    std::vector<std::byte> storage(static_cast<std::size_t>(storage_bytes));
+    // Over-allocated so the slots can start on a block boundary, which uncached fills require.
+    std::vector<std::byte> backing(static_cast<std::size_t>(storage_bytes + kAlign));
+    const std::span<std::byte> storage(
+        backing.data() + (kAlign - reinterpret_cast<std::uintptr_t>(backing.data()) % kAlign) % kAlign,
+        static_cast<std::size_t>(storage_bytes));
     Resolver resolver{&extents};
     const auto sources = single_source(kSource, file_bytes);
     const std::size_t batches = o.limit_batches ? std::min<std::size_t>(batch_count, o.limit_batches) : batch_count;
@@ -236,28 +246,30 @@ int main(int argc, char** argv) {
         cfg.max_tickets = 4;
         cfg.max_batch_rows = max_batch;
         cfg.fill_chunk_bytes = chunk_bytes;
+        cfg.fill_alignment = alignment;
         auto table = SizeClassedTable::create(cfg, sub0mempage::FillBackendRef(**backend));
         if (!table) fail("size-classed table create failed (budget below two batches per class?)");
         for (const auto& cls : (*table)->classes()) {
             budget_rows += cls.budget_rows;
-            used_bytes += cls.budget_rows * cls.width;
+            used_bytes += cls.budget_rows * cls.slot_bytes;
             std::printf("  class %llu B: %llu rows, %u resident\n", static_cast<unsigned long long>(cls.width),
                         static_cast<unsigned long long>(cls.rows), cls.budget_rows);
         }
         r = replay(**table, trace, extents, batches, max_batch, o.compute_us);
     } else {
-        budget_rows = storage_bytes / row_bytes;
-        used_bytes = budget_rows * row_bytes;
+        budget_rows = storage_bytes / slot_bytes;
+        used_bytes = budget_rows * slot_bytes;
         if (budget_rows < 2ull * max_batch) fail("budget holds fewer than two batches");
         TableConfig cfg{};
         cfg.row_count = extents.size();
         cfg.source_row_bytes = row_bytes;
-        cfg.output_row_bytes = row_bytes;
+        cfg.output_row_bytes = slot_bytes;
+        cfg.fill_alignment = alignment;
         cfg.row_extent = RowExtent::bounded;
         cfg.sources = sources;
         cfg.generation = 1;
         cfg.resolve_extent = RowExtentResolverRef(resolver);
-        cfg.output_storage = std::span(storage).first(static_cast<std::size_t>(used_bytes));
+        cfg.output_storage = storage.first(static_cast<std::size_t>(used_bytes));
         cfg.budget_rows = static_cast<std::uint32_t>(budget_rows);
         cfg.max_tickets = 4;
         cfg.max_batch_rows = max_batch;
@@ -272,7 +284,7 @@ int main(int argc, char** argv) {
     std::printf("trace-replay: %zu batches, %llu accesses, budget %llu rows (%.1f GiB), %u readers, compute %.0f us/batch, chunk %llu KiB%s\n",
                 batches, static_cast<unsigned long long>(r.accesses), static_cast<unsigned long long>(budget_rows),
                 static_cast<double>(used_bytes) / (1ull << 30), o.readers, o.compute_us,
-                static_cast<unsigned long long>(o.chunk_kib), o.size_classed ? ", size-classed" : "");
+                static_cast<unsigned long long>(o.chunk_kib), o.uncached ? (o.size_classed ? ", size-classed, uncached" : ", uncached") : o.size_classed ? ", size-classed" : "");
     std::printf("  hit rate %.2f%% | misses %llu (%.2f GiB read) | fetches %llu, evictions %llu\n", 100 * hit_rate,
                 static_cast<unsigned long long>(r.misses), static_cast<double>(r.miss_bytes) / (1ull << 30),
                 static_cast<unsigned long long>(r.stats.fetches), static_cast<unsigned long long>(r.stats.evictions));

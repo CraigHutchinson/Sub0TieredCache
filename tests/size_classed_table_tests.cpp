@@ -7,6 +7,7 @@
 #include <sub0tieredcache/sub0tieredcache.hpp>
 
 #include <array>
+#include <atomic>
 #include <vector>
 
 namespace {
@@ -130,11 +131,92 @@ void test_registration_refusals() {
           "storage too small for two batches per class is refused");
 }
 
+/// Forwards to the fake backend, recording whether every request met an uncached backend's rules:
+/// aligned source offset and destination, and an aligned length unless the request runs to the source's end.
+struct AlignmentCheckingBackend {
+    Backend& inner;
+    std::uint64_t alignment;
+    std::atomic<std::uint32_t> requests{0}, misaligned{0};
+    bool submit(const sub0mempage::FillRequest& request) noexcept {
+        const bool to_end = request.source_offset + request.destination.size() == kSourceBytes;
+        const bool ok = request.source_offset % alignment == 0 &&
+                        reinterpret_cast<std::uintptr_t>(request.destination.data()) % alignment == 0 &&
+                        (request.destination.size() % alignment == 0 || to_end);
+        requests.fetch_add(1);
+        if (!ok) misaligned.fetch_add(1);
+        return inner.submit(request);
+    }
+};
+
+void test_aligned_window_fills() {
+    constexpr std::uint64_t kAlignment = 32;
+    Backend fake(64);
+    AlignmentCheckingBackend backend{fake, kAlignment};
+    TwoWidthResolver resolver;
+    // Both widths (8 and 12) need a 64-byte slot at alignment 32; eight slots per class.
+    alignas(64) static std::array<std::byte, 1024> storage;
+    const auto sources = single_source(SourceId{1}, kSourceBytes);
+    auto cfg = config(storage, sources, RowExtentResolverRef(resolver));
+    cfg.fill_alignment = kAlignment;
+    auto table = SizeClassedTable::create(cfg, FillBackendRef(backend));
+    check(table.has_value(), "an aligned-window table registers");
+    const auto classes = (*table)->classes();
+    check(classes.size() == 2 && classes[0].slot_bytes == 64 && classes[1].slot_bytes == 64,
+          "each class's slot holds its widest aligned window");
+    check(classes[0].budget_rows == 8 && classes[1].budget_rows == 8, "storage is split in whole slots");
+    {
+        BackgroundCompleter pump(fake);
+        // Rows that start mid-block, one that straddles a block boundary, and the last row, whose
+        // window is clipped at the end of the source (240 bytes: not a multiple of 32).
+        for (const std::uint64_t row : {std::uint64_t{0}, std::uint64_t{1}, std::uint64_t{3}, std::uint64_t{6}, kRows - 1}) {
+            const std::array<std::uint64_t, 1> rows{row};
+            std::vector<RowLease> out(1);
+            auto got = (*table)->resolve_into(rows, out);
+            check(got.has_value(), "an aligned-window row resolves");
+            check(out[0].bytes().size() == width(row), "the lease exposes exactly the row, not its window");
+            check(matches_source(out[0].bytes(), offset(row)), "row bytes match the source oracle");
+        }
+    }
+    check(backend.requests.load() == 5 && backend.misaligned.load() == 0, "every fill request was block-aligned");
+    fake.complete_all_newest_first();
+    (void)(*table)->drain();
+
+    // Chunked: a 64-byte window in 32-byte reads.
+    Backend chunk_fake(64);
+    AlignmentCheckingBackend chunked{chunk_fake, kAlignment};
+    alignas(64) static std::array<std::byte, 1024> chunk_storage;
+    auto chunk_cfg = config(chunk_storage, sources, RowExtentResolverRef(resolver));
+    chunk_cfg.fill_alignment = kAlignment;
+    chunk_cfg.fill_chunk_bytes = kAlignment;
+    auto chunk_table = SizeClassedTable::create(chunk_cfg, FillBackendRef(chunked));
+    check(chunk_table.has_value(), "a chunked aligned-window table registers");
+    {
+        BackgroundCompleter pump(chunk_fake);
+        const std::array<std::uint64_t, 1> rows{3}; // bytes 28..40: straddles the first block boundary
+        std::vector<RowLease> out(1);
+        check((*chunk_table)->resolve_into(rows, out).has_value(), "a row spanning two chunks resolves");
+        check(matches_source(out[0].bytes(), offset(3)), "its bytes match the oracle across the chunk seam");
+    }
+    check(chunked.requests.load() == 2 && chunked.misaligned.load() == 0, "the window was read as two aligned chunks");
+    chunk_fake.complete_all_newest_first();
+    (void)(*chunk_table)->drain();
+
+    // Refusals: storage that does not start on the alignment, and a chunk that is not a multiple of it.
+    auto bad = config(std::span(storage).subspan(8, 1024 - 64), sources, RowExtentResolverRef(resolver));
+    bad.fill_alignment = kAlignment;
+    check(!SizeClassedTable::create(bad, FillBackendRef(backend)).has_value(), "misaligned storage is refused");
+    auto bad_chunk = config(storage, sources, RowExtentResolverRef(resolver));
+    bad_chunk.fill_alignment = kAlignment;
+    bad_chunk.fill_chunk_bytes = 24;
+    check(!SizeClassedTable::create(bad_chunk, FillBackendRef(backend)).has_value(), "a misaligned chunk size is refused");
+}
+
 } // namespace
 
 int main() {
     run(test_classes_and_exact_slots, "classes_and_exact_slots");
     run(test_resolve_is_all_or_nothing, "resolve_is_all_or_nothing");
     run(test_registration_refusals, "registration_refusals");
+    run(test_aligned_window_fills, "aligned_window_fills");
     return finish();
 }
