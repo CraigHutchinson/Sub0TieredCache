@@ -2,6 +2,9 @@ execute_process(COMMAND "${CMAKE_COMMAND}" -S "${SOURCE}/tests/cmake/consumer" -
   -G "${GENERATOR}" "-DCMAKE_CXX_COMPILER=${COMPILER}" "-DCMAKE_BUILD_TYPE=${CONFIG}"
   "-DTIEREDCACHE_SOURCE_DIR=${SOURCE}" "-DFETCHCONTENT_SOURCE_DIR_SUB0MEMPAGE=${MEMPAGE}"
   -DFETCHCONTENT_FULLY_DISCONNECTED=ON "-DPROVIDE_MEMPAGE=${PROVIDE}"
+  # The parent build's flags: a standard-library choice (the clang CI job needs -stdlib=libc++ for
+  # <expected>) or sanitizers must reach the consumer, or it builds against a different configuration.
+  "-DCMAKE_CXX_FLAGS=${FLAGS}" "-DCMAKE_EXE_LINKER_FLAGS=${LINK_FLAGS}"
   RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors)
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "Consumer configure failed: ${output} ${errors}")

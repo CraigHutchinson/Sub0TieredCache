@@ -42,6 +42,8 @@ foreach(_provided IN ITEMS ON OFF)
             "-DCOMPILER=${CMAKE_CXX_COMPILER}"
             "-DCONFIG=$<CONFIG>"
             "-DPROVIDE=${_provided}"
+            "-DFLAGS=${CMAKE_CXX_FLAGS}"
+            "-DLINK_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_consumer.cmake")
     set_tests_properties(sub0tieredcache.consumer-${_provided} PROPERTIES TIMEOUT 120)
 endforeach()
