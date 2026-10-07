@@ -52,8 +52,9 @@ target_compile_features(Sub0TieredCache INTERFACE cxx_std_23)
 #     -DFETCHCONTENT_FULLY_DISCONNECTED=ON
 # Bumped for T1: Sub0MemPage's M3 slice 1 (local_file_backend.hpp) and its exported
 # Sub0MemPage::testing target (testing/include/sub0mempage/testing/fake_backend.hpp), merged to main
-# via PR #1.
-set(SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION "213acdd2121cec369c6b9606c514db2231e94f27"
+# via PR #1. Bumped again for FileAccess::uncached (bench/trace_replay's --uncached, and the backend that
+# TableConfig::fill_alignment exists to serve) and TransferSet::submit's live-claim scan (chunked fills).
+set(SUB0TIEREDCACHE_SUB0MEMPAGE_REVISION "f74b65ea494af6e9b7d70069a3b0732e8c6f9da0"
     CACHE STRING "Pinned Sub0MemPage commit (docs/integration-plan.md acceptance order).")
 
 # Consumers may supply the dependency themselves; otherwise resolve the same pinned dependency
